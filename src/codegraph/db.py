@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS imports (
     is_reexport INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_qname ON nodes(qualified_name);
@@ -222,6 +227,19 @@ class Database:
             raise
         else:
             self.conn.commit()
+
+    # ------------------------------------------------------------------ meta
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
     # ----------------------------------------------------------------- files
 

@@ -165,3 +165,20 @@ def test_excluded_directories_are_never_walked(config: Config, summary):
         paths = [row["path"] for row in graph.conn.execute("SELECT path FROM files")]
     assert not any("node_modules" in path for path in paths)
     assert again.parsed == 0
+
+
+def test_a_codegraph_upgrade_forces_one_full_rebuild(config: Config, summary):
+    """Unchanged files are never revisited, so a tool upgrade must reset the graph."""
+    with Database.open(config.db_path) as db:
+        db.set_meta("codegraph_version", "0.0.1-old")
+        db.conn.commit()
+
+    again = build(config)
+    assert again.forced_full is True
+    assert again.unchanged == 0
+    assert again.parsed == summary.parsed
+    assert "rebuilt from scratch" in again.render()
+
+    once_more = build(config)
+    assert once_more.forced_full is False
+    assert once_more.parsed == 0

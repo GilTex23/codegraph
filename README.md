@@ -14,15 +14,32 @@ TypeScript, `sqlite3` for storage.
 
 ## Install
 
+codegraph is a tool, not a project dependency — install it once, into the
+Python on your PATH, and use it from every project:
+
 ```bash
-pip install -e /path/to/codegraph
+python -m pip install -e /path/to/codegraph
 ```
 
-Requires Python 3.11+.
+Installing it into a project's virtualenv also works, but then the executable
+only exists inside that venv, and desktop agent apps launching `codegraph`
+will not find it. Requires Python 3.11+.
 
 ## Use
 
 From the root of the project you want to index:
+
+```bash
+codegraph init
+```
+
+That detects the layout, writes `.codegraph.toml`, adds `.codegraph/` to an
+existing `.gitignore`, and registers the MCP server in `.mcp.json`. It never
+overwrites anything (`--force` to replace the config) and prints what it
+guessed, so a wrong guess is easy to correct by hand. `--no-gitignore` and
+`--no-mcp` opt out of the parts that touch other files.
+
+Then build the graph:
 
 ```bash
 codegraph build
@@ -32,6 +49,7 @@ That writes `.codegraph/graph.db`. Re-running it is incremental — unchanged
 files are skipped by content hash. Use `--full` to rebuild from scratch.
 
 ```bash
+codegraph init           # detect the layout and write the config
 codegraph stats          # what ended up in the graph
 codegraph query Task     # search without an agent, for debugging
 codegraph serve          # MCP server on stdio
@@ -70,29 +88,55 @@ backend_framework = "fastapi"
 frontend_api_dir = "frontend/src/api/"
 ```
 
-## Connecting to Claude Code
+## Connecting an agent
 
-From the project you indexed:
+The server speaks MCP over stdio, so any MCP client can run it. Whichever
+client you use, `codegraph` has to be findable: a GUI app inherits the system
+PATH and knows nothing about your project's virtualenv, so install the tool
+globally (see above) or spell out the full path to the executable.
+
+**Claude Code** (CLI and desktop app) reads `.mcp.json` from the project root —
+`codegraph init` writes it for you. To register it by hand instead:
 
 ```bash
-claude mcp add codegraph -- codegraph serve --config /abs/path/to/.codegraph.toml
+claude mcp add codegraph -- codegraph serve --config .codegraph.toml
 ```
 
-Or add it to `.mcp.json` in the project root so it is shared with the team:
+**Claude Desktop** reads `%APPDATA%\Claude\claude_desktop_config.json` on
+Windows (`~/Library/Application Support/Claude/` on macOS); the app opens it
+from Settings → Developer → Edit Config. It has no notion of a current project,
+so the config path must be absolute:
 
 ```json
 {
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve"],
-      "cwd": "."
+      "args": ["serve", "--config", "C:/path/to/project/.codegraph.toml"]
     }
   }
 }
 ```
 
+**Codex** reads `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--config", "C:/path/to/project/.codegraph.toml"]
+```
+
+Add one block per project you want indexed, under distinct names
+(`codegraph_shop`, `codegraph_admin`), since these configs are global.
+
 Rebuild the graph after substantial edits — it is a snapshot, not a live view.
+A `post-commit` and `post-merge` git hook running `codegraph build` keeps it
+current for a couple of seconds per commit:
+
+```bash
+printf '#!/bin/sh\ncodegraph build >/dev/null 2>&1 || true\n' > .git/hooks/post-commit
+chmod +x .git/hooks/post-commit
+```
 
 ## MCP tools
 

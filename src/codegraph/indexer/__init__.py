@@ -11,7 +11,9 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from .. import __version__
 from ..config import Config
 from ..db import Database
 from ..models import ParseResult
@@ -26,6 +28,7 @@ __all__ = ["BuildSummary", "build"]
 
 @dataclass(slots=True)
 class BuildSummary:
+    forced_full: bool = False
     parsed: int = 0
     unchanged: int = 0
     removed: int = 0
@@ -63,8 +66,18 @@ class BuildSummary:
             lines.extend(f"  - {item}" for item in items[:10])
             if len(items) > 10:
                 lines.append(f"  ... and {len(items) - 10} more")
+        if self.forced_full:
+            lines.append(f"(rebuilt from scratch: codegraph is now {__version__})")
         lines.append(f"done in {self.duration_seconds:.2f}s")
         return "\n".join(lines)
+
+
+def _built_by_another_version(db_path) -> bool:
+    """True when an existing graph was written by a different codegraph."""
+    if not Path(db_path).exists():
+        return False
+    with Database.open(db_path) as db:
+        return db.get_meta("codegraph_version") != __version__
 
 
 def parse_source(rel_path: str, source: str, language: str) -> ParseResult:
@@ -84,6 +97,13 @@ def build(
     """Index the project described by ``config`` into its graph database."""
     started = time.perf_counter()
     summary = BuildSummary()
+
+    # A codegraph upgrade can change how names resolve or what the parsers
+    # extract, and unchanged files are otherwise never revisited.  Rebuild once,
+    # automatically, rather than leaving a subtly stale graph behind.
+    if not full and _built_by_another_version(config.db_path):
+        full = True
+        summary.forced_full = True
 
     discovered, skipped = walk(
         root=config.root,
@@ -127,6 +147,7 @@ def build(
 
         summary.bridge = run_bridge(db, config)
 
+        db.set_meta("codegraph_version", __version__)
         counts = db.counts()
         summary.files = counts["files"]
         summary.nodes = counts["nodes"]
