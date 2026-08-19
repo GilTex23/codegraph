@@ -1,0 +1,4 @@
+# Line endings are normalised in the repository. The indexer hashes sources
+# with newlines normalised, so CRLF checkouts still work, but pinning LF keeps
+# the test fixtures byte-identical on every platform.
+* text=auto eol=lf

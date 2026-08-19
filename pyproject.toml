@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codegraph"
+version = "0.1.0"
+description = "Local code-graph indexer with an MCP server, for token-efficient codebase exploration by AI agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "tree-sitter>=0.24",
+    "tree-sitter-typescript>=0.23",
+    "mcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+codegraph = "codegraph.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codegraph"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+# Fixture projects contain deliberately broken sources.
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# SIM905: a wrapped word list stays readable; a literal list does not.
+ignore = ["B905", "SIM905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
