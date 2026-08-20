@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -318,6 +319,137 @@ class GraphTools:
         )
         return row[0] if row else None
 
+    # ------------------------------------------------------------ directories
+
+    def get_directory_outline(self, path: str) -> str:
+        """One line per file: how many declarations and the exported names.
+
+        Deliberately coarser than ``get_file_outline`` -- this answers "which
+        file do I want", and seventeen full outlines would cost more than
+        reading a file.
+        """
+        prefix = Path(path).as_posix().strip("/").lstrip("./")
+        rows = self._query(
+            "SELECT f.path, n.name, n.type, n.is_exported, n.line_start "
+            "FROM files f LEFT JOIN nodes n ON n.file_id = f.id AND n.type != 'module' "
+            "WHERE f.path = ? OR f.path LIKE ? ORDER BY f.path, n.line_start",
+            (prefix, f"{prefix}/%"),
+        )
+        if not rows:
+            return f"no indexed files under {path!r}"
+
+        files: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            files.setdefault(row["path"], [])
+            if row["name"]:
+                files[row["path"]].append(row)
+
+        out = [f"{prefix}/  {len(files)} files"]
+        for file_path, declarations in list(files.items())[: self.limit]:
+            # Exports first, then internals to fill the line: a page module
+            # exports one component whose name repeats the filename, which tells
+            # the reader nothing they did not already have. Constants sink to
+            # the bottom -- a module opening with a block of UPPER_CASE would
+            # otherwise spend the whole line saying nothing about what it does.
+            ranked = sorted(
+                declarations,
+                key=lambda row: (row["type"] == "variable", not row["is_exported"]),
+            )
+            headline = list(dict.fromkeys(row["name"] for row in ranked))
+            shown = ", ".join(headline[:6])
+            more = "…" if len(headline) > 6 else ""
+            name = file_path[len(prefix) + 1 :] if file_path != prefix else file_path
+            out.append(f"  {name}  {len(declarations)}  {shown}{more}")
+        if len(files) > self.limit:
+            out.append(f"... {len(files) - self.limit} more files")
+        return "\n".join(out)
+
+    # ----------------------------------------------------------- change impact
+
+    def get_change_impact(self, base: str | None = None) -> str:
+        """Declarations you are currently editing, plus who calls them."""
+        changes, source = self._changed_regions(base)
+        if not changes:
+            return f"no changes detected ({source})"
+
+        out = [f"changed files ({source}):"]
+        budget = self.limit
+        for rel_path, ranges in list(changes.items())[: self.limit]:
+            file = self._find_file(rel_path)
+            if file is None:
+                out.append(f"{rel_path}  (not indexed)")
+                continue
+            where = _render_ranges(ranges)
+            out.append(f"{file['path']}{'  ' + where if where else ''}")
+            for node in self._nodes_touching(file["id"], ranges)[:budget]:
+                label = node["signature"] or node["name"]
+                if len(label) > 90:  # a changed constant should not spend a line on its value
+                    label = label[:89] + "…"
+                out.append(f"  {node['type']} {label}  L{node['line_start']}-{node['line_end']}")
+                callers = self._query(
+                    "SELECT s.name, sf.path, e.line, e.confidence FROM edges e "
+                    "JOIN nodes s ON s.id = e.src_id JOIN files sf ON sf.id = s.file_id "
+                    "WHERE e.type IN ('calls', 'calls_api') AND e.dst_id = ? "
+                    "ORDER BY sf.path LIMIT 6",
+                    (node["id"],),
+                )
+                for caller in callers:
+                    mark = " [heuristic]" if caller["confidence"] == "heuristic" else ""
+                    out.append(f"    <- {caller['name']}  {caller['path']}:{caller['line']}{mark}")
+                if not callers:
+                    out.append("    <- no callers in the graph")
+        if len(changes) > self.limit:
+            out.append(f"... {len(changes) - self.limit} more files")
+        return "\n".join(out)
+
+    def _nodes_touching(self, file_id: int, ranges: list[tuple[int, int]]) -> list[sqlite3.Row]:
+        """Declarations overlapping the changed lines; all of them if unknown."""
+        if not ranges:
+            return self._query(
+                "SELECT id, name, type, signature, line_start, line_end FROM nodes "
+                "WHERE file_id = ? AND type != 'module' AND parent_id IS NULL "
+                "ORDER BY line_start LIMIT 20",
+                (file_id,),
+            )
+        seen: dict[int, sqlite3.Row] = {}
+        for start, end in ranges:
+            for row in self._query(
+                "SELECT id, name, type, signature, line_start, line_end FROM nodes "
+                "WHERE file_id = ? AND type != 'module' AND line_start <= ? AND line_end >= ? "
+                "ORDER BY (line_end - line_start) LIMIT 5",
+                (file_id, end, start),
+            ):
+                seen.setdefault(row["id"], row)
+        return sorted(seen.values(), key=lambda row: row["line_start"])
+
+    def _changed_regions(self, base: str | None) -> tuple[dict[str, list[tuple[int, int]]], str]:
+        """Which files changed, and where -- from git, or from the graph itself.
+
+        Git is the better answer but not a given: the project may not be a
+        repository, git may not be installed, or the tool may run somewhere it
+        cannot execute it. Falling back to hashes the graph already stores keeps
+        the tool useful instead of turning a missing binary into an error.
+        """
+        from_git = _git_changes(self.config.root, base)
+        if from_git is not None:
+            return from_git, "git working tree" if base is None else f"git, against {base}"
+
+        stale = self._files_differing_from_the_graph()
+        return stale, "no git here; files changed since the last build"
+
+    def _files_differing_from_the_graph(self) -> dict[str, list[tuple[int, int]]]:
+        from ..indexer.walker import hash_text, read_source
+
+        changed: dict[str, list[tuple[int, int]]] = {}
+        for row in self._query("SELECT path, content_hash FROM files ORDER BY path"):
+            try:
+                current = hash_text(read_source(self.config.root / row["path"]))
+            except OSError:
+                continue
+            if current != row["content_hash"]:
+                changed[row["path"]] = []
+        return changed
+
     # -------------------------------------------------------------- neighbors
 
     def get_neighbors(self, name: str, depth: int = 1) -> str:
@@ -522,6 +654,68 @@ class GraphTools:
 
 
 # ------------------------------------------------------------------ utilities
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _git(root: Path, *args: str) -> str | None:
+    """Run a read-only git command; ``None`` if git cannot answer."""
+    try:
+        finished = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", *args],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None  # git missing, unrunnable, or too slow
+    return finished.stdout if finished.returncode == 0 else None
+
+
+def _git_changes(root: Path, base: str | None) -> dict[str, list[tuple[int, int]]] | None:
+    """Changed files and their new line ranges, or ``None`` without git."""
+    if _git(root, "rev-parse", "--is-inside-work-tree") is None:
+        return None
+
+    arguments = ["diff", "--unified=0", "--no-color", "--no-ext-diff"]
+    if base:
+        arguments.append(base)
+    diff = _git(root, *arguments)
+    if diff is None:
+        return None
+
+    changes: dict[str, list[tuple[int, int]]] = {}
+    current: str | None = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            current = None if target == "/dev/null" else target.removeprefix("b/")
+            if current:
+                changes.setdefault(current, [])
+        elif current and (match := _HUNK_RE.match(line)):
+            start = int(match.group(1))
+            count = int(match.group(2) or 1)
+            if count:
+                changes[current].append((start, start + count - 1))
+
+    # Brand new files have no hunks to parse but are very much part of the work.
+    untracked = _git(root, "ls-files", "--others", "--exclude-standard")
+    for name in (untracked or "").splitlines():
+        if name.strip():
+            changes.setdefault(name.strip(), [])
+    return changes
+
+
+def _render_ranges(ranges: list[tuple[int, int]]) -> str:
+    if not ranges:
+        return ""
+    parts = [str(start) if start == end else f"{start}-{end}" for start, end in ranges[:6]]
+    more = "…" if len(ranges) > 6 else ""
+    return f"lines {', '.join(parts)}{more}"
 
 
 def _with_truncation_note(lines: list[str], total: int, limit: int) -> str:

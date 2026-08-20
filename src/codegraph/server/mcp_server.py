@@ -23,7 +23,9 @@ Prefer these tools over reading files. Typical flow:
   get_domain_slice("task") -> every layer touching one domain entity, in one call
   search_symbol / get_definition -> find and read one declaration
   get_callers / get_callees / get_neighbors -> follow the blast radius of a change
+  get_directory_outline    -> which file do I want, before opening one
   get_file_outline         -> instead of reading a whole file
+  get_change_impact        -> what am I editing, and what does it break
   trace_endpoint           -> follow one HTTP route end to end
 
 The graph is a snapshot; re-run `codegraph build` after large edits.
@@ -91,6 +93,29 @@ def build_server(config: Config):
         what is in it. Bodies are never included.
         """
         return tools.get_file_outline(path)
+
+    @server.tool()
+    def get_directory_outline(path: str) -> str:
+        """What is in a directory: one line per file with its exported names.
+
+        Use this to decide **which** file you want, before spending a
+        `get_file_outline` on it. Coarser on purpose — names only, no
+        signatures — so a folder of twenty files still costs a few hundred
+        tokens.
+        """
+        return tools.get_directory_outline(path)
+
+    @server.tool()
+    def get_change_impact(base: str | None = None) -> str:
+        """What you are editing right now, and who calls it.
+
+        Use at the start of a task to see the blast radius of work in progress:
+        changed files, the declarations inside the changed lines, and their
+        callers. `base` optionally names a git ref to compare against (a branch
+        or commit); by default it reports uncommitted work. Falls back to
+        comparing the working tree against the graph when git is unavailable.
+        """
+        return tools.get_change_impact(base)
 
     @server.tool()
     def get_imports(path: str) -> str:

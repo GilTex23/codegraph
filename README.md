@@ -179,12 +179,21 @@ chmod +x .git/hooks/post-commit
 | `get_callers(name)` | before changing a signature or deleting code |
 | `get_callees(name)` | to see what a function does without reading it |
 | `get_file_outline(path)` | instead of reading a whole file |
+| `get_directory_outline(path)` | which file you want, before opening one |
+| `get_change_impact(base=None)` | what you are editing and what it breaks |
 | `get_imports(path)` | to map module boundaries and blast radius |
 | `get_neighbors(name, depth=1)` | to get context around an unfamiliar symbol |
 | `trace_endpoint(path_or_name)` | to follow one HTTP route end to end |
 
 All of them open the database read-only, respect `server.max_results`, and
 never return function bodies except `get_definition` on a short declaration.
+
+`get_change_impact` reads the git working tree when it can — changed files, the
+declarations inside the changed line ranges, and the callers of those. Git is
+not a requirement: without a repository, without the binary, or where it cannot
+be run, it compares the working tree against the hashes the graph already
+stores and says which source it used. A missing git is a different answer, not
+an error.
 
 ## What it extracts
 

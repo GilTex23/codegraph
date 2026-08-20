@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
 
 import pytest
 
@@ -16,6 +18,8 @@ EXPECTED_TOOLS = {
     "get_callers",
     "get_callees",
     "get_file_outline",
+    "get_directory_outline",
+    "get_change_impact",
     "get_imports",
     "get_neighbors",
     "get_project_overview",
@@ -157,6 +161,114 @@ def test_get_imports_shows_both_directions(tools: GraphTools):
 
 def test_get_imports_marks_reexports(tools: GraphTools):
     assert "[re-export]" in tools.get_imports("frontend/src/types/index.ts")
+
+
+# ---------------------------------------------------------------- directories
+
+
+def test_get_directory_outline_summarises_each_file(tools: GraphTools):
+    output = tools.get_directory_outline("backend/app/models")
+    assert "backend/app/models/  3 files" in output
+    assert "task.py" in output and "Task" in output
+    assert "base.py" in output and "Base" in output
+
+
+def test_get_directory_outline_is_cheaper_than_the_file_outlines(tools: GraphTools):
+    """It answers "which file", so it must cost far less than opening them."""
+    directory = tools.get_directory_outline("backend/app/models")
+    files = "".join(
+        tools.get_file_outline(f"backend/app/models/{name}.py") for name in ("base", "task")
+    )
+    assert len(directory) < len(files)
+    assert "def complete" not in directory  # no signatures at this zoom level
+
+
+def test_get_directory_outline_prefers_exports_then_internals(tools: GraphTools):
+    output = tools.get_directory_outline("backend/app/services")
+    assert "TaskService" in output
+
+
+def test_get_directory_outline_accepts_a_trailing_slash(tools: GraphTools):
+    assert tools.get_directory_outline("backend/app/models/") == tools.get_directory_outline(
+        "backend/app/models"
+    )
+
+
+def test_get_directory_outline_reports_an_unknown_directory(tools: GraphTools):
+    assert "no indexed files" in tools.get_directory_outline("nowhere/at/all")
+
+
+# --------------------------------------------------------------- change impact
+
+
+def test_change_impact_falls_back_to_the_graph_without_git(config: Config, summary):
+    """A project need not be a git repository for the tool to be useful."""
+    target = config.root / "backend" / "app" / "models" / "task.py"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("def complete", "def finish"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    instance = GraphTools(config)
+    try:
+        output = instance.get_change_impact()
+    finally:
+        instance.close()
+    assert "no git here" in output
+    assert "backend/app/models/task.py" in output
+
+
+def test_change_impact_says_so_when_nothing_changed(config: Config, summary):
+    instance = GraphTools(config)
+    try:
+        output = instance.get_change_impact()
+    finally:
+        instance.close()
+    assert "no changes detected" in output
+
+
+def test_change_impact_survives_a_missing_git_binary(config: Config, summary, monkeypatch):
+    """The tool must degrade, not raise, where git is not installed."""
+    import codegraph.server.tools as tools_module
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(tools_module.subprocess, "run", no_git)
+    instance = GraphTools(config)
+    try:
+        output = instance.get_change_impact()
+    finally:
+        instance.close()
+    assert "no git here" in output
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_change_impact_reads_the_git_working_tree(config: Config, summary):
+    root = config.root
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"],
+        cwd=root,
+        check=True,
+    )
+    target = root / "backend" / "app" / "services" / "task_service.py"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("return [Task()]", "return [Task(), Task()]"),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    instance = GraphTools(config)
+    try:
+        output = instance.get_change_impact()
+    finally:
+        instance.close()
+    assert "git working tree" in output
+    assert "task_service.py" in output
+    assert "list_tasks" in output
+    assert "<- get_task" in output  # the blast radius, which is the point
 
 
 # ------------------------------------------------------------------- neighbors
