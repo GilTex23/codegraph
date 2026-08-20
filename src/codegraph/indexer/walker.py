@@ -25,12 +25,14 @@ LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".pyi": "python",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".php": "php",
 }
 
 # config language name -> the file.language values it enables
 SUFFIXES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
     "python": (".py", ".pyi"),
     "typescript": (".ts", ".tsx"),
+    "php": (".php",),
 }
 
 

@@ -1,0 +1,11 @@
+[project]
+root = "."
+db_path = ".codegraph/graph.db"
+
+[index]
+include = ["."]
+languages = ["php"]
+
+[bridge]
+enabled = true
+backend_framework = "wordpress"

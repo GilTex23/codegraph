@@ -20,6 +20,7 @@ from ..config import Config
 from ..db import Database
 from ..models import ParseResult
 from .bridge import BridgeStats, run_bridge
+from .php_parser import parse_php
 from .python_parser import parse_python
 from .resolver import ResolveStats, resolve
 from .ts_parser import parse_typescript
@@ -59,12 +60,19 @@ class BuildSummary:
                 else ""
             ),
         ]
-        if self.bridge.endpoints or self.bridge.api_calls:
-            lines.append(
-                f"bridge: {self.bridge.endpoints} endpoints "
-                f"({self.bridge.handled} with handlers), "
-                f"{self.bridge.api_calls_matched}/{self.bridge.api_calls} frontend calls matched"
-            )
+        if self.bridge.endpoints or self.bridge.api_calls or self.bridge.hooks:
+            parts = [f"{self.bridge.endpoints} endpoints ({self.bridge.handled} handled)"]
+            if self.bridge.hooks:
+                parts.append(f"{self.bridge.hooks} hooks")
+            if self.bridge.templates:
+                parts.append(
+                    f"{self.bridge.templates_matched}/{self.bridge.templates} template parts"
+                )
+            if self.bridge.api_calls:
+                parts.append(
+                    f"{self.bridge.api_calls_matched}/{self.bridge.api_calls} frontend calls"
+                )
+            lines.append("bridge: " + ", ".join(parts))
         for label, items in (("skipped", self.problems), ("parsed with errors", self.parse_errors)):
             if not items:
                 continue
@@ -116,6 +124,8 @@ def parse_source(rel_path: str, source: str, language: str) -> ParseResult:
     """Dispatch to the parser for a file's language."""
     if language == "python":
         return parse_python(rel_path, source)
+    if language == "php":
+        return parse_php(rel_path, source)
     return parse_typescript(rel_path, source, language)
 
 

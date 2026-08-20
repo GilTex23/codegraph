@@ -84,7 +84,33 @@ def test_bridge_stays_off_without_fastapi(tmp_path: Path):
     assert result.detected.fastapi is False
     config = tomllib.loads(result.config_path.read_text(encoding="utf-8"))
     assert config["bridge"]["enabled"] is False
-    assert any("no FastAPI" in note for note in result.notes)
+    assert any("no supported framework" in note for note in result.notes)
+
+
+def test_a_wordpress_theme_selects_the_wordpress_pack(tmp_path: Path):
+    root = tmp_path / "theme"
+    (root / "template-parts").mkdir(parents=True)
+    (root / "functions.php").write_text(
+        "<?php\nadd_action('init', function () {});\n", encoding="utf-8"
+    )
+    (root / "template-parts" / "hero.php").write_text("<?php\n", encoding="utf-8")
+
+    result = init_project(root, clients=[])
+    assert result.detected.wordpress is True
+    assert result.detected.framework == "wordpress"
+    config = tomllib.loads(result.config_path.read_text(encoding="utf-8"))
+    assert config["bridge"]["enabled"] is True
+    assert config["bridge"]["backend_framework"] == "wordpress"
+    assert config["index"]["languages"] == ["php"]
+
+
+def test_plain_php_without_wordpress_leaves_the_bridge_off(tmp_path: Path):
+    root = tmp_path / "plainphp"
+    root.mkdir()
+    (root / "lib.php").write_text("<?php\nfunction helper() { return 1; }\n", encoding="utf-8")
+    result = init_project(root, clients=[])
+    assert result.detected.php_files == 1
+    assert result.detected.framework is None
 
 
 def test_a_flat_project_gets_a_dot_include(tmp_path: Path):

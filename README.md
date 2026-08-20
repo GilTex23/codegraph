@@ -10,7 +10,7 @@ lines back.
 
 Fully offline and deterministic: no LLMs, no embeddings, no vector store, no
 network calls, no graph database. Python's `ast` for Python, `tree-sitter` for
-TypeScript, `sqlite3` for storage.
+TypeScript and PHP, `sqlite3` for storage.
 
 ## Install
 
@@ -206,6 +206,20 @@ functions and function expressions), classes and methods, interfaces, type
 aliases, enums, module-level constants, JSDoc; `export`-awareness; functions
 returning JSX are typed `component`. Same edge kinds, plus `implements`.
 
+**PHP** (`tree-sitter`, mixed HTML/PHP grammar so templates parse): functions,
+classes, methods, interfaces, traits, enums, `const` and `define()` constants,
+docblocks; visibility drives the export flag; `require`/`include` and `use`
+become imports. A block-bodied closure passed as an argument gets a node named
+after the call receiving it (`add_action(wp_head)`) — WordPress themes keep
+most of their logic there, and without a node the block would be invisible and
+every call inside it credited to a file thousands of lines long.
+
+PHP resolution is exact where the language is: functions live in one global
+namespace with no import mechanism, so a unique project-wide name *is* the
+definition, and a bare name the project does not declare *must* come from
+outside it — the runtime, WordPress core, a plugin. Both are facts, not
+heuristics.
+
 **Resolution** runs as a whole-project pass, in priority order: a declaration
 in the same file (exact), an explicitly imported name (exact), a
 project-globally unique name (heuristic), otherwise unresolved with the raw
@@ -250,7 +264,17 @@ retries, keeping the result only while the parse actually improves. Semicolons
 add no lines, so reported line numbers still match the file on disk. Genuinely
 broken files still report an error and are not silently "fixed".
 
-**The HTTP bridge** (optional, `indexer/bridge.py`) reads FastAPI route
+**The bridge** (optional) reconstructs links no language expresses. Pick the
+pack with `[bridge] backend_framework`.
+
+*wordpress* (`indexer/wordpress.py`) reads the theme's string-based wiring:
+`add_action`/`add_filter` become `hook` nodes with a `handles` edge to the
+callback — a named function or the closure written inline; `wp_ajax_*` is an
+HTTP endpoint hiding in a hook name and becomes an `endpoint`;
+`get_template_part('template-parts/hero')` becomes a `renders` edge to the file
+it pulls in; `register_rest_route` becomes an endpoint too.
+
+*fastapi* (`indexer/bridge.py`) reads FastAPI route
 decorators into `endpoint` nodes — folding in `APIRouter(prefix=…)` and
 `include_router(…, prefix=…)` — and matches frontend request literals against
 them. Both sides are normalised (`/tasks/{task_id}` and `/tasks/${id}` both

@@ -46,6 +46,9 @@ class BridgeStats:
     handled: int = 0
     api_calls: int = 0
     api_calls_matched: int = 0
+    hooks: int = 0
+    templates: int = 0
+    templates_matched: int = 0
 
 
 @dataclass(slots=True)
@@ -88,11 +91,24 @@ def run_bridge(db: Database, config: Config) -> BridgeStats:
         return stats
 
     with db.transaction() as conn:
+        # Whatever a previous run of any framework pack wrote is regenerated
+        # wholesale, so switching frameworks cannot leave orphans behind.
         conn.execute(
-            "DELETE FROM edges WHERE type IN ('handles', 'calls_api') "
-            "OR dst_id IN (SELECT id FROM nodes WHERE type = 'endpoint')"
+            "DELETE FROM edges WHERE type IN ('handles', 'calls_api', 'renders') "
+            "OR dst_id IN (SELECT id FROM nodes WHERE type IN ('endpoint', 'hook'))"
         )
-        conn.execute("DELETE FROM nodes WHERE type = 'endpoint'")
+        conn.execute("DELETE FROM nodes WHERE type IN ('endpoint', 'hook')")
+
+        if config.bridge.backend_framework == "wordpress":
+            from .wordpress import run_wordpress
+
+            wordpress = run_wordpress(db, config)
+            stats.endpoints = wordpress.ajax_endpoints + wordpress.rest_endpoints
+            stats.handled = wordpress.hooks_handled
+            stats.hooks = wordpress.hooks
+            stats.templates = wordpress.templates
+            stats.templates_matched = wordpress.templates_matched
+            return stats
 
         endpoints = _index_backend(db, config, stats)
         if config.bridge.frontend_api_dir:

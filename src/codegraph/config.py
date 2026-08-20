@@ -27,10 +27,11 @@ DEFAULT_EXCLUDE: tuple[str, ...] = (
     "**/.git/**",
     "**/.codegraph/**",
     "**/logs/**",
+    "**/vendor/**",
 )
 
-KNOWN_LANGUAGES = ("python", "typescript")
-KNOWN_FRAMEWORKS = ("fastapi",)
+KNOWN_LANGUAGES = ("python", "typescript", "php")
+KNOWN_FRAMEWORKS = ("fastapi", "wordpress")
 
 
 class ConfigError(Exception):

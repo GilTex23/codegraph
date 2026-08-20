@@ -24,6 +24,7 @@ from .indexer.walker import compile_ignore, is_ignored, rel_posix
 
 MAX_SCANNED_FILES = 20000
 FASTAPI_MARKERS = ("from fastapi", "import fastapi", "APIRouter(")
+WORDPRESS_MARKERS = ("add_action(", "add_filter(", "get_template_part(", "wp_enqueue_")
 API_DIR_NAMES = ("api", "services", "client", "clients")
 
 GITIGNORE_HEADER = "# codegraph index"
@@ -44,10 +45,13 @@ class Detected:
 
     python_roots: list[str] = field(default_factory=list)
     ts_roots: list[str] = field(default_factory=list)
+    php_roots: list[str] = field(default_factory=list)
     fastapi: bool = False
+    wordpress: bool = False
     frontend_api_dir: str | None = None
     python_files: int = 0
     ts_files: int = 0
+    php_files: int = 0
 
     @property
     def languages(self) -> list[str]:
@@ -56,12 +60,23 @@ class Detected:
             languages.append("python")
         if self.ts_files:
             languages.append("typescript")
+        if self.php_files:
+            languages.append("php")
         return languages or ["python", "typescript"]
 
     @property
     def include(self) -> list[str]:
-        roots = [*self.python_roots, *self.ts_roots]
+        roots = [*self.python_roots, *self.ts_roots, *self.php_roots]
         return sorted(dict.fromkeys(roots)) or ["."]
+
+    @property
+    def framework(self) -> str | None:
+        """The bridge pack that fits, if any: only one runs per project."""
+        if self.wordpress:
+            return "wordpress"
+        if self.fastapi and self.frontend_api_dir:
+            return "fastapi"
+        return None
 
 
 @dataclass(slots=True)
@@ -91,6 +106,7 @@ def detect(root: Path) -> Detected:
     found = Detected()
     python_paths: list[str] = []
     ts_paths: list[str] = []
+    php_paths: list[str] = []
     scanned = 0
 
     for path in sorted(root.rglob("*")):
@@ -110,22 +126,33 @@ def detect(root: Path) -> Detected:
         elif suffix in (".ts", ".tsx"):
             scanned += 1
             ts_paths.append(relative)
+        elif suffix == ".php":
+            scanned += 1
+            php_paths.append(relative)
+            if not found.wordpress and _mentions(path, WORDPRESS_MARKERS):
+                found.wordpress = True
 
     found.python_files = len(python_paths)
     found.ts_files = len(ts_paths)
+    found.php_files = len(php_paths)
     found.python_roots = _source_roots(python_paths, root)
     found.ts_roots = _source_roots(ts_paths, root)
+    found.php_roots = _source_roots(php_paths, root)
     found.frontend_api_dir = _api_dir(found.ts_roots, root)
     return found
 
 
-def _mentions_fastapi(path: Path) -> bool:
+def _mentions(path: Path, markers: tuple[str, ...]) -> bool:
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             head = handle.read(4096)
     except OSError:
         return False
-    return any(marker in head for marker in FASTAPI_MARKERS)
+    return any(marker in head for marker in markers)
+
+
+def _mentions_fastapi(path: Path) -> bool:
+    return _mentions(path, FASTAPI_MARKERS)
 
 
 def _source_roots(paths: list[str], root: Path) -> list[str]:
@@ -174,7 +201,8 @@ def render_config(detected: Detected) -> str:
     languages = ", ".join(f'"{name}"' for name in detected.languages)
     exclude = "\n".join(f'    "{pattern}",' for pattern in DEFAULT_EXCLUDE)
 
-    bridge_enabled = "true" if detected.fastapi and detected.frontend_api_dir else "false"
+    framework = detected.framework
+    bridge_enabled = "true" if framework else "false"
     api_dir = detected.frontend_api_dir or "frontend/src/api/"
 
     return f"""\
@@ -197,10 +225,11 @@ max_file_size_kb = 512
 max_results = 50
 snippet_max_lines = 40
 
-# Links frontend API calls to the backend handlers that serve them.
+# Reconstructs the links the language cannot express -- HTTP routes for
+# fastapi, hooks and template parts for wordpress.
 [bridge]
 enabled = {bridge_enabled}
-backend_framework = "fastapi"
+backend_framework = "{framework or "fastapi"}"
 frontend_api_dir = "{api_dir}"
 """
 
@@ -240,12 +269,13 @@ def init_project(
     if update_gitignore:
         _apply_gitignore(root, _gitignore_entries(wanted), result)
 
-    if not detected.fastapi:
-        result.notes.append("no FastAPI usage found; [bridge] left disabled")
-    elif not detected.frontend_api_dir:
-        result.notes.append(
-            "FastAPI found but no frontend API directory; set [bridge] frontend_api_dir by hand"
-        )
+    if detected.framework is None:
+        if detected.fastapi:
+            result.notes.append(
+                "FastAPI found but no frontend API directory; set [bridge] frontend_api_dir by hand"
+            )
+        else:
+            result.notes.append("no supported framework found; [bridge] left disabled")
     return result
 
 
@@ -447,7 +477,7 @@ def render_report(result: InitResult) -> str:
     lines = [
         f"detected: {detected.python_files} Python file(s), {detected.ts_files} TypeScript file(s)",
         f"include:  {', '.join(detected.include)}",
-        f"bridge:   {'fastapi' if detected.fastapi else 'not detected'}"
+        f"bridge:   {detected.framework or 'not detected'}"
         + (f"  api dir: {detected.frontend_api_dir}" if detected.frontend_api_dir else ""),
         "",
         f"{'wrote' if result.config_written else 'kept'} {result.config_path.name}",

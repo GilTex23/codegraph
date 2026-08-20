@@ -36,6 +36,7 @@ SYMBOL_EDGE_TYPES = ("calls", "inherits", "decorates", "implements", "references
 
 TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mjs", ".cjs")
 PY_EXTENSIONS = (".py", ".pyi")
+PHP_EXTENSIONS = (".php",)
 
 # Bare-name calls that carry no information for an agent.  Python builtins plus
 # the handful of JS/TS globals that show up constantly.  A project that defines
@@ -50,7 +51,30 @@ _JS_GLOBALS = frozenset(
     """.split()
 )
 
-BUILTIN_CALL_NAMES = frozenset(dir(builtins)) | _JS_GLOBALS
+# PHP's standard library is procedural and unimported, so its noisiest names
+# have to be listed rather than derived. Only the ones that appear constantly
+# and say nothing about a codebase.
+_PHP_BUILTINS = frozenset(
+    """
+    abs array_column array_diff array_fill array_filter array_flip array_key_exists array_keys
+    array_map array_merge array_pop array_push array_reverse array_search array_shift array_slice
+    array_splice array_sum array_unique array_unshift array_values arsort asort basename
+    call_user_func call_user_func_array ceil class_exists compact count current date defined
+    define dirname empty
+    end explode file_exists file_get_contents file_put_contents filemtime filter_var floatval floor
+    function_exists func_get_args gettype implode in_array intdiv intval is_array is_bool
+    is_callable is_dir is_file is_float is_int is_null is_numeric is_object is_string isset
+    iterator_to_array json_decode json_encode key krsort ksort ltrim max method_exists min
+    number_format ob_get_clean ob_start preg_match preg_match_all preg_quote preg_replace
+    preg_replace_callback preg_split
+    property_exists range rawurlencode reset round rsort rtrim serialize settype sort sprintf
+    str_contains str_ends_with str_pad str_repeat str_replace str_split str_starts_with strcmp
+    strip_tags stripslashes strlen strpos strrpos strtolower strtotime strtoupper strtr strval
+    substr substr_count trim uasort uksort unserialize usort var_dump vsprintf wordwrap
+    """.split()
+)
+
+BUILTIN_CALL_NAMES = frozenset(dir(builtins)) | _JS_GLOBALS | _PHP_BUILTINS
 
 
 @dataclass(slots=True)
@@ -115,6 +139,7 @@ class _Resolver:
         self.by_name: dict[str, list[_Node]] = {}
         self.module_node: dict[int, int] = {}
         self.python_modules: dict[str, list[_File]] = {}
+        self.php_by_suffix: dict[str, list[_File]] = {}
         self.ts_aliases: list[tuple[str, str, list[str]]] = []
 
     # ------------------------------------------------------------------- run
@@ -237,6 +262,7 @@ class _Resolver:
                 self.by_name.setdefault(node.name, []).append(node)
 
         self._index_python_modules()
+        self._index_php_paths()
 
     def _index_python_modules(self) -> None:
         """Map every dotted module name a Python file could be imported as."""
@@ -245,6 +271,20 @@ class _Resolver:
                 continue
             for key in python_module_keys(file.path):
                 self.python_modules.setdefault(key, []).append(file)
+
+    def _index_php_paths(self) -> None:
+        """Index every trailing path fragment a PHP file could be required by.
+
+        ``require_once Z52_CHILD_DIR . '/inc/x.php'`` keeps only the literal
+        tail; the constant in front is unknowable from the source, so matching
+        happens on the suffix.
+        """
+        for file in self.files.values():
+            if file.language != "php":
+                continue
+            parts = file.path.split("/")
+            for start in range(len(parts)):
+                self.php_by_suffix.setdefault("/".join(parts[start:]), []).append(file)
 
     def _load_tsconfig(self) -> None:
         """``compilerOptions.paths`` aliases, if the project has a tsconfig."""
@@ -308,11 +348,23 @@ class _Resolver:
             node for node in self.by_name.get(dst_name, []) if self._same_language(source, node)
         ]
         if len(candidates) == 1:
-            return candidates[0].id, "heuristic"
+            # PHP has a single global namespace for functions and classes, so a
+            # project-wide unique name is not a guess -- it is how the language
+            # resolves the call at runtime.
+            certain = source.language == "php" and candidates[0].parent_id is None
+            return candidates[0].id, "exact" if certain else "heuristic"
 
-        # 4. Nothing -- but say so precisely: a name imported from a module
+        # 4. Nothing -- but say so precisely.  A name imported from a module
         # outside the indexed tree (react, fastapi, sqlalchemy) is not a gap in
         # the graph, it is a third-party symbol that can never be resolved.
+        #
+        # PHP makes this exact rather than a guess: functions live in one global
+        # namespace with no import mechanism, so a bare name the project does
+        # not declare *must* come from outside it -- the language runtime,
+        # WordPress core, a plugin.  Method calls still need a receiver type, so
+        # they stay genuinely unknown.
+        if not external and source.language == "php" and dst_full in (None, dst_name):
+            external = True
         return None, "external" if external else "exact"
 
     def _same_language(self, source: _File, node: _Node) -> bool:
@@ -427,7 +479,28 @@ class _Resolver:
     def _resolve_module(self, source: _File, raw_module: str) -> _File | None:
         if source.language == "python":
             return self._resolve_python_module(source, raw_module)
+        if source.language == "php":
+            return self._resolve_php_module(source, raw_module)
         return self._resolve_ts_module(source, raw_module)
+
+    def _resolve_php_module(self, source: _File, raw_module: str) -> _File | None:
+        if "\\" in raw_module:
+            return None  # a namespace, not a file: nothing on disk to point at
+        cleaned = _normalize(raw_module)
+        if not cleaned:
+            return None
+
+        direct = self._lookup_path(cleaned)
+        if direct is not None:
+            return direct
+        if source.dir:
+            near = self._lookup_path(_normalize(f"{source.dir}/{cleaned}"))
+            if near is not None:
+                return near
+        candidates = self.php_by_suffix.get(cleaned)
+        if candidates and len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def _resolve_python_module(self, source: _File, raw_module: str) -> _File | None:
         level = len(raw_module) - len(raw_module.lstrip("."))
@@ -526,8 +599,10 @@ def python_module_keys(path: str) -> list[str]:
 
 
 def _family(language: str) -> str:
-    """Python and TypeScript never resolve into each other."""
-    return "python" if language == "python" else "typescript"
+    """Languages never resolve into one another; tsx counts as TypeScript."""
+    if language in ("python", "php"):
+        return language
+    return "typescript"
 
 
 def _raw_module(imp: _Import) -> str:

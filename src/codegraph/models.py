@@ -19,9 +19,11 @@ NODE_TYPES = (
     "variable",
     "interface",
     "type_alias",
+    "trait",
     "enum",
     "component",
     "endpoint",
+    "hook",
 )
 
 # Edge types.  'handles' / 'calls_api' come from the HTTP bridge pass.
@@ -34,6 +36,7 @@ EDGE_TYPES = (
     "references",
     "handles",
     "calls_api",
+    "renders",
 )
 
 MAX_DOCSTRING_CHARS = 500
