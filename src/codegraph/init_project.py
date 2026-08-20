@@ -12,6 +12,10 @@ so a wrong guess is obvious and easy to correct by hand.
 from __future__ import annotations
 
 import json
+import shutil
+import sys
+import tomllib
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +27,15 @@ FASTAPI_MARKERS = ("from fastapi", "import fastapi", "APIRouter(")
 API_DIR_NAMES = ("api", "services", "client", "clients")
 
 GITIGNORE_HEADER = "# codegraph index"
+
+# Agent clients init can register the MCP server with.
+CLIENTS = ("claude", "codex")
+
+CODEX_DIR = ".codex"
+CODEX_CONFIG = "config.toml"
+MCP_JSON = ".mcp.json"
+CODEX_TABLE = "[mcp_servers.codegraph]"
+CODEX_STARTUP_TIMEOUT_SEC = 30
 
 
 @dataclass(slots=True)
@@ -52,14 +65,23 @@ class Detected:
 
 
 @dataclass(slots=True)
+class ClientResult:
+    """Outcome of registering the MCP server with one agent client."""
+
+    name: str
+    path: Path
+    written: bool = False
+    already_present: bool = False
+
+
+@dataclass(slots=True)
 class InitResult:
     config_path: Path
     config_written: bool
     detected: Detected
     gitignore_path: Path | None = None
-    gitignore_updated: bool = False
-    mcp_path: Path | None = None
-    mcp_written: bool = False
+    gitignore_added: list[str] = field(default_factory=list)
+    clients: list[ClientResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -188,12 +210,17 @@ def init_project(
     *,
     force: bool = False,
     update_gitignore: bool = True,
-    write_mcp: bool = True,
+    clients: Sequence[str] | None = None,
 ) -> InitResult:
-    """Write the config, ignore the index, and register the MCP server."""
+    """Write the config, ignore the index, and register the MCP server.
+
+    ``clients`` selects which agents to register with; ``None`` means all of
+    them, an empty sequence means none.
+    """
     root = root.resolve()
     detected = detect(root)
     config_path = root / CONFIG_FILENAME
+    wanted = list(CLIENTS) if clients is None else [c for c in CLIENTS if c in clients]
 
     result = InitResult(config_path=config_path, config_written=False, detected=detected)
 
@@ -205,11 +232,13 @@ def init_project(
         config_path.write_text(render_config(detected), encoding="utf-8", newline="\n")
         result.config_written = True
 
-    if update_gitignore:
-        _apply_gitignore(root, result)
+    if "claude" in wanted:
+        _apply_claude(root, result)
+    if "codex" in wanted:
+        _apply_codex(root, config_path, force, result)
 
-    if write_mcp:
-        _apply_mcp_json(root, result)
+    if update_gitignore:
+        _apply_gitignore(root, _gitignore_entries(wanted), result)
 
     if not detected.fastapi:
         result.notes.append("no FastAPI usage found; [bridge] left disabled")
@@ -220,13 +249,28 @@ def init_project(
     return result
 
 
-def _apply_gitignore(root: Path, result: InitResult) -> None:
-    """Add the index directory to an existing .gitignore, never create one."""
+def _gitignore_entries(clients: Sequence[str]) -> list[str]:
+    """What this run produced that must not reach version control.
+
+    ``.mcp.json`` is deliberately absent: it holds a relative config path
+    precisely so a team can share it. ``.codex/config.toml`` cannot be shared --
+    it pins absolute paths to one machine's interpreter and checkout.
+    """
+    entries = [".codegraph/"]
+    if "codex" in clients:
+        entries.append(f"{CODEX_DIR}/")
+    return entries
+
+
+# --------------------------------------------------------------------- ignore
+
+
+def _apply_gitignore(root: Path, entries: Iterable[str], result: InitResult) -> None:
+    """Add the generated paths to an existing .gitignore, never create one."""
     gitignore = root / ".gitignore"
     if not gitignore.exists():
-        result.notes.append(
-            "no .gitignore here; remember to keep .codegraph/ out of version control"
-        )
+        listed = ", ".join(entries)
+        result.notes.append(f"no .gitignore here; keep {listed} out of version control yourself")
         return
 
     result.gitignore_path = gitignore
@@ -236,53 +280,165 @@ def _apply_gitignore(root: Path, result: InitResult) -> None:
         result.notes.append(f".gitignore could not be read: {error}")
         return
 
-    entries = {line.strip().rstrip("/") for line in existing.splitlines()}
-    if ".codegraph" in entries:
+    present = {line.strip().rstrip("/") for line in existing.splitlines()}
+    missing = [entry for entry in entries if entry.rstrip("/") not in present]
+    if not missing:
         return
 
     separator = "" if existing.endswith("\n") or not existing else "\n"
-    addition = f"{separator}\n{GITIGNORE_HEADER}\n.codegraph/\n"
+    body = "\n".join(missing)
+    # A later run adding one more entry should extend the section, not start a
+    # second one with the same heading.
+    heading = "" if GITIGNORE_HEADER in existing else f"{GITIGNORE_HEADER}\n"
     try:
         with open(gitignore, "a", encoding="utf-8", newline="\n") as handle:
-            handle.write(addition)
+            handle.write(f"{separator}\n{heading}{body}\n")
     except OSError as error:
         result.notes.append(f".gitignore could not be written: {error}")
         return
-    result.gitignore_updated = True
+    result.gitignore_added = missing
 
 
-def _apply_mcp_json(root: Path, result: InitResult) -> None:
+# --------------------------------------------------------------------- clients
+
+
+def _apply_claude(root: Path, result: InitResult) -> None:
     """Register the server in project-scoped .mcp.json, which Claude Code reads."""
-    mcp_path = root / ".mcp.json"
-    result.mcp_path = mcp_path
+    mcp_path = root / MCP_JSON
+    client = ClientResult(name="claude", path=mcp_path)
+    result.clients.append(client)
+
     # A relative config path keeps the file portable -- .mcp.json is usually
     # committed, and an absolute path would break for everyone else. Clients
     # launch project servers with the project root as the working directory; if
     # one does not, serve fails with a clear "config not found" instead of
     # silently walking up into some other project.
-    entry = {
-        "command": "codegraph",
-        "args": ["serve", "--config", CONFIG_FILENAME],
-    }
+    entry = {"command": "codegraph", "args": ["serve", "--config", CONFIG_FILENAME]}
 
     if mcp_path.exists():
         try:
             data = json.loads(mcp_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
-            result.notes.append(f".mcp.json exists but could not be parsed ({error}); left alone")
+            result.notes.append(f"{MCP_JSON} exists but could not be parsed ({error}); left alone")
             return
         servers = data.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
-            result.notes.append(".mcp.json has an unexpected shape; left alone")
+            result.notes.append(f"{MCP_JSON} has an unexpected shape; left alone")
             return
         if "codegraph" in servers:
+            client.already_present = True
             return
         servers["codegraph"] = entry
     else:
         data = {"mcpServers": {"codegraph": entry}}
 
     mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
-    result.mcp_written = True
+    client.written = True
+
+
+def _apply_codex(root: Path, config_path: Path, force: bool, result: InitResult) -> None:
+    """Register the server in a project-local .codex/config.toml.
+
+    Codex has no notion of a project root when it launches a server, so every
+    path here is absolute and ``cwd`` is pinned -- which is also why the file
+    is machine-specific and gets gitignored.
+    """
+    codex_path = root / CODEX_DIR / CODEX_CONFIG
+    client = ClientResult(name="codex", path=codex_path)
+    result.clients.append(client)
+
+    block = render_codex_entry(codegraph_executable(), config_path, root)
+
+    if not codex_path.exists():
+        codex_path.parent.mkdir(parents=True, exist_ok=True)
+        codex_path.write_text(block, encoding="utf-8", newline="\n")
+        client.written = True
+        return
+
+    try:
+        existing = codex_path.read_text(encoding="utf-8", errors="replace")
+        already = "codegraph" in (tomllib.loads(existing).get("mcp_servers") or {})
+    except OSError as error:
+        result.notes.append(f"{CODEX_DIR}/{CODEX_CONFIG} could not be read: {error}")
+        return
+    except tomllib.TOMLDecodeError as error:
+        result.notes.append(f"{CODEX_DIR}/{CODEX_CONFIG} is not valid TOML ({error}); left alone")
+        return
+
+    if already and not force:
+        client.already_present = True
+        return
+
+    updated = _replace_codex_block(existing, block) if already else _append_block(existing, block)
+    codex_path.write_text(updated, encoding="utf-8", newline="\n")
+    client.written = True
+
+
+def _append_block(existing: str, block: str) -> str:
+    separator = "" if existing.endswith("\n") or not existing else "\n"
+    return f"{existing}{separator}\n{block}"
+
+
+def _replace_codex_block(existing: str, block: str) -> str:
+    """Swap an existing ``[mcp_servers.codegraph]`` table for a fresh one.
+
+    Only ``--force`` gets here, and only to refresh paths that a moved
+    virtualenv or checkout has invalidated.
+    """
+    lines = existing.splitlines(keepends=True)
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == CODEX_TABLE),
+        None,
+    )
+    if start is None:
+        return _append_block(existing, block)
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("["):
+            end = index
+            break
+    return "".join(lines[:start]) + block + "".join(lines[end:])
+
+
+def codegraph_executable() -> str:
+    """Absolute path to this codegraph, for clients that do not share our PATH.
+
+    A desktop app inherits the system PATH and knows nothing about the
+    virtualenv codegraph was installed into, so a bare ``codegraph`` would not
+    be found. The console script sits next to the interpreter running us.
+    """
+    scripts = Path(sys.executable).parent
+    for name in ("codegraph.exe", "codegraph"):
+        candidate = scripts / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("codegraph") or "codegraph"
+
+
+def render_codex_entry(executable: str, config_path: Path, root: Path) -> str:
+    """The ``[mcp_servers.codegraph]`` table for a project-local Codex config."""
+    return (
+        f"{CODEX_TABLE}\n"
+        f"enabled = true\n"
+        f"command = {_toml_string(executable)}\n"
+        f"args = [\n"
+        f"    'serve',\n"
+        f"    '--config',\n"
+        f"    {_toml_string(str(config_path))},\n"
+        f"]\n"
+        f"cwd = {_toml_string(str(root))}\n"
+        f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}\n"
+    )
+
+
+def _toml_string(value: str) -> str:
+    """Prefer a literal string so Windows backslashes survive verbatim."""
+    if "'" in value or "\n" in value:
+        return json.dumps(value)  # a valid TOML basic string, backslashes escaped
+    return f"'{value}'"
+
+
+# ---------------------------------------------------------------------- report
 
 
 def render_report(result: InitResult) -> str:
@@ -296,14 +452,16 @@ def render_report(result: InitResult) -> str:
         "",
         f"{'wrote' if result.config_written else 'kept'} {result.config_path.name}",
     ]
-    if result.gitignore_updated:
-        lines.append("added .codegraph/ to .gitignore")
+    for client in result.clients:
+        where = client.path.relative_to(result.config_path.parent).as_posix()
+        if client.written:
+            lines.append(f"registered for {client.name} in {where}")
+        elif client.already_present:
+            lines.append(f"{where} already lists codegraph")
+    if result.gitignore_added:
+        lines.append(f"added {', '.join(result.gitignore_added)} to .gitignore")
     elif result.gitignore_path is not None:
-        lines.append(".gitignore already covers .codegraph/")
-    if result.mcp_written:
-        lines.append("registered the MCP server in .mcp.json (read by Claude Code)")
-    elif result.mcp_path is not None and result.mcp_path.exists():
-        lines.append(".mcp.json already lists codegraph")
+        lines.append(".gitignore already covers the generated files")
     lines.extend(f"note: {note}" for note in result.notes)
     lines.append("")
     lines.append("next: codegraph build")

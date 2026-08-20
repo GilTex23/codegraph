@@ -31,7 +31,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("path", nargs="?", type=Path, default=Path("."), help="project root")
     init.add_argument("--force", action="store_true", help="replace an existing config")
     init.add_argument("--no-gitignore", action="store_true", help="do not touch .gitignore")
-    init.add_argument("--no-mcp", action="store_true", help="do not write .mcp.json")
+    init.add_argument("--claude", action="store_true", help="register for Claude Code in .mcp.json")
+    init.add_argument(
+        "--codex", action="store_true", help="register for Codex in .codex/config.toml"
+    )
+    init.add_argument(
+        "--no-clients", action="store_true", help="do not register the server with any agent"
+    )
 
     build = subparsers.add_parser("build", help="index the project (incremental by default)")
     build.add_argument("--config", type=Path, help="path to .codegraph.toml")
@@ -90,11 +96,20 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
+
+    # No client flag means every client; naming one narrows it to those named.
+    if args.no_clients:
+        clients: list[str] | None = []
+    elif args.claude or args.codex:
+        clients = [name for name, on in (("claude", args.claude), ("codex", args.codex)) if on]
+    else:
+        clients = None
+
     result = init_project(
         root,
         force=args.force,
         update_gitignore=not args.no_gitignore,
-        write_mcp=not args.no_mcp,
+        clients=clients,
     )
     print(render_report(result))
     return 0

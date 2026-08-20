@@ -26,6 +26,7 @@ DEFAULT_EXCLUDE: tuple[str, ...] = (
     "**/alembic/versions/**",
     "**/.git/**",
     "**/.codegraph/**",
+    "**/logs/**",
 )
 
 KNOWN_LANGUAGES = ("python", "typescript")

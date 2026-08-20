@@ -33,11 +33,22 @@ From the root of the project you want to index:
 codegraph init
 ```
 
-That detects the layout, writes `.codegraph.toml`, adds `.codegraph/` to an
-existing `.gitignore`, and registers the MCP server in `.mcp.json`. It never
-overwrites anything (`--force` to replace the config) and prints what it
-guessed, so a wrong guess is easy to correct by hand. `--no-gitignore` and
-`--no-mcp` opt out of the parts that touch other files.
+That detects the layout, writes `.codegraph.toml`, registers the MCP server
+with your agents, and adds what it generated to an existing `.gitignore`. It
+never overwrites anything (`--force` to replace the config, and to refresh a
+Codex entry whose paths went stale) and prints what it guessed, so a wrong
+guess is easy to correct by hand.
+
+Pick which agents to register with — no flag means all of them:
+
+```bash
+codegraph init --claude          # .mcp.json only
+codegraph init --codex           # .codex/config.toml only
+codegraph init --claude --codex  # same as no flag
+codegraph init --no-clients      # just the config
+```
+
+`--no-gitignore` leaves `.gitignore` alone.
 
 Then build the graph:
 
@@ -118,16 +129,32 @@ so the config path must be absolute:
 }
 ```
 
-**Codex** reads `~/.codex/config.toml`:
+**Codex** gets a project-local `.codex/config.toml` from `codegraph init
+--codex`:
 
 ```toml
 [mcp_servers.codegraph]
-command = "codegraph"
-args = ["serve", "--config", "C:/path/to/project/.codegraph.toml"]
+enabled = true
+command = 'C:\project\venv\Scripts\codegraph.exe'
+args = [
+    'serve',
+    '--config',
+    'C:\project\.codegraph.toml',
+]
+cwd = 'C:\project'
+startup_timeout_sec = 30
 ```
 
-Add one block per project you want indexed, under distinct names
-(`codegraph_shop`, `codegraph_admin`), since these configs are global.
+Every path is absolute and `command` points at the exact executable that ran
+`init`, because Codex launches the server with no project context and no
+knowledge of your virtualenv. That also makes the file machine-specific, which
+is why `init` gitignores `.codex/`. The same block works in the global
+`~/.codex/config.toml` if you would rather keep it there — give each project a
+distinct table name (`[mcp_servers.codegraph_shop]`) since that file is shared.
+
+Note the split: `.mcp.json` is meant to be committed and holds a *relative*
+config path so it works for the whole team; `.codex/config.toml` cannot be
+shared and is ignored.
 
 Rebuild the graph after substantial edits — it is a snapshot, not a live view.
 A `post-commit` and `post-merge` git hook running `codegraph build` keeps it
