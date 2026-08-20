@@ -203,7 +203,12 @@ def render_config(detected: Detected) -> str:
 
     framework = detected.framework
     bridge_enabled = "true" if framework else "false"
-    api_dir = detected.frontend_api_dir or "frontend/src/api/"
+    # Only the fastapi pack reads frontend_api_dir; emitting it for wordpress
+    # would be a dead setting inviting someone to wonder what it does.
+    api_dir_line = ""
+    if framework != "wordpress":
+        api_dir = detected.frontend_api_dir or "frontend/src/api/"
+        api_dir_line = f'\nfrontend_api_dir = "{api_dir}"'
 
     return f"""\
 # Written by `codegraph init`. Edit freely -- nothing regenerates this.
@@ -229,8 +234,7 @@ snippet_max_lines = 40
 # fastapi, hooks and template parts for wordpress.
 [bridge]
 enabled = {bridge_enabled}
-backend_framework = "{framework or "fastapi"}"
-frontend_api_dir = "{api_dir}"
+backend_framework = "{framework or "fastapi"}"{api_dir_line}
 """
 
 

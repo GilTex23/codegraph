@@ -102,6 +102,15 @@ def test_a_wordpress_theme_selects_the_wordpress_pack(tmp_path: Path):
     assert config["bridge"]["enabled"] is True
     assert config["bridge"]["backend_framework"] == "wordpress"
     assert config["index"]["languages"] == ["php"]
+    # frontend_api_dir belongs to the fastapi pack; here it would be dead weight.
+    assert "frontend_api_dir" not in config["bridge"]
+
+
+def test_the_fastapi_pack_still_gets_its_frontend_directory(fresh: Path):
+    result = init_project(fresh, clients=[])
+    config = tomllib.loads(result.config_path.read_text(encoding="utf-8"))
+    assert config["bridge"]["backend_framework"] == "fastapi"
+    assert config["bridge"]["frontend_api_dir"] == "frontend/src/api/"
 
 
 def test_plain_php_without_wordpress_leaves_the_bridge_off(tmp_path: Path):

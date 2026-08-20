@@ -24,6 +24,20 @@ def test_glob_patterns_behave_like_gitignore():
     assert matches("**/migrations/**", "app/db/migrations/0001.py")
 
 
+def test_a_single_file_can_be_excluded_by_name(tmp_path: Path):
+    """A build script beside the code is not part of the code."""
+    (tmp_path / "inc").mkdir()
+    (tmp_path / "deploy.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("y = 2\n", encoding="utf-8")
+    (tmp_path / "inc" / "deploy.py").write_text("z = 3\n", encoding="utf-8")
+
+    found, _ = walk(tmp_path, ["."], ["python"], ["deploy.py"])
+    assert [file.path for file in found] == ["app.py", "inc/deploy.py"]
+
+    found, _ = walk(tmp_path, ["."], ["python"], ["**/deploy.py"])
+    assert [file.path for file in found] == ["app.py"]
+
+
 def test_rel_posix_never_emits_a_backslash(tmp_path: Path):
     nested = tmp_path / "a" / "b" / "c.py"
     nested.parent.mkdir(parents=True)
