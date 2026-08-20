@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codegraph"
-version = "0.1.0"
+version = "0.1.6"
 description = "Local code-graph indexer with an MCP server, for token-efficient codebase exploration by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"

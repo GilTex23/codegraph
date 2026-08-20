@@ -9,3 +9,4 @@ venv/
 .ruff_cache/
 .codegraph/
 *.db
+.idea/
