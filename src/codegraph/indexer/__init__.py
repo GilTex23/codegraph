@@ -8,6 +8,8 @@ names resolve elsewhere -- and it is cheap compared to parsing.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -50,8 +52,12 @@ class BuildSummary:
             f"({self.parsed} parsed, {self.unchanged} unchanged, {self.removed} removed)",
             f"graph:  {self.nodes} nodes, {self.edges} edges  "
             f"({self.heuristic_edges} heuristic, {self.external_edges} third-party, "
-            f"{self.unresolved_edges - self.external_edges} unknown, "
-            f"{self.dropped_builtin_edges} builtin calls dropped)",
+            f"{self.unresolved_edges - self.external_edges} unknown)"
+            + (
+                f"  {self.dropped_builtin_edges} builtin calls dropped"
+                if self.dropped_builtin_edges
+                else ""
+            ),
         ]
         if self.bridge.endpoints or self.bridge.api_calls:
             lines.append(
@@ -67,17 +73,43 @@ class BuildSummary:
             if len(items) > 10:
                 lines.append(f"  ... and {len(items) - 10} more")
         if self.forced_full:
-            lines.append(f"(rebuilt from scratch: codegraph is now {__version__})")
+            lines.append("(rebuilt from scratch: codegraph itself changed)")
         lines.append(f"done in {self.duration_seconds:.2f}s")
         return "\n".join(lines)
 
 
-def _built_by_another_version(db_path) -> bool:
-    """True when an existing graph was written by a different codegraph."""
+def fingerprint_sources(package: Path) -> str:
+    """Hash every ``.py`` under ``package``, newline-normalised."""
+    digest = hashlib.sha256(__version__.encode())
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode())
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()[:16]
+
+
+@functools.cache
+def source_fingerprint() -> str:
+    """Identity of the codegraph *code*, not of its version number.
+
+    An editable install runs straight from a working tree, where the version
+    string sits still while the resolver changes underneath it -- so keying
+    staleness on ``__version__`` would quietly serve graphs built by older
+    logic. Hashing the package's own sources means any edit to the tool
+    invalidates the graphs it produced, with no discipline required from
+    whoever edits it.
+    """
+    try:
+        return fingerprint_sources(Path(__file__).resolve().parent.parent)
+    except OSError:  # frozen or unreadable install: the version is all we have
+        return __version__
+
+
+def _built_by_another_build(db_path) -> bool:
+    """True when an existing graph was written by different codegraph code."""
     if not Path(db_path).exists():
         return False
     with Database.open(db_path) as db:
-        return db.get_meta("codegraph_version") != __version__
+        return db.get_meta("codegraph_build") != source_fingerprint()
 
 
 def parse_source(rel_path: str, source: str, language: str) -> ParseResult:
@@ -101,7 +133,7 @@ def build(
     # A codegraph upgrade can change how names resolve or what the parsers
     # extract, and unchanged files are otherwise never revisited.  Rebuild once,
     # automatically, rather than leaving a subtly stale graph behind.
-    if not full and _built_by_another_version(config.db_path):
+    if not full and _built_by_another_build(config.db_path):
         full = True
         summary.forced_full = True
 
@@ -148,6 +180,7 @@ def build(
         summary.bridge = run_bridge(db, config)
 
         db.set_meta("codegraph_version", __version__)
+        db.set_meta("codegraph_build", source_fingerprint())
         counts = db.counts()
         summary.files = counts["files"]
         summary.nodes = counts["nodes"]

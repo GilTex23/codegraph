@@ -155,6 +155,26 @@ def _cmd_stats(config: Config) -> int:
             f"third-party: {external}   unknown: {counts['unresolved_edges'] - external}"
         )
 
+        # A single percentage hides the fact that half the call edges could
+        # never resolve: `obj.method()` needs type inference, which is out of
+        # scope by design. Split by call shape so the number means something.
+        print("\ncall resolution by shape:")
+        shapes = (
+            ("foo()", "(e.dst_full IS NULL OR e.dst_full = e.dst_name)"),
+            ("obj.foo()", "e.dst_full IS NOT NULL AND e.dst_full != e.dst_name"),
+        )
+        for label, predicate in shapes:
+            row = db.conn.execute(
+                "SELECT count(*) AS total, "
+                "sum(e.resolved) AS resolved, "
+                "sum(e.confidence = 'external') AS external "
+                f"FROM edges e WHERE e.type = 'calls' AND ({predicate})"
+            ).fetchone()
+            total, done = row["total"] or 0, row["resolved"] or 0
+            resolvable = total - (row["external"] or 0)
+            share = f"{100 * done / resolvable:.1f}%" if resolvable else "n/a"
+            print(f"  {label:11} {done:5}/{resolvable:5} resolvable  ({share})")
+
         print("\nnodes by type:")
         for row in db.conn.execute(
             "SELECT type, count(*) AS n FROM nodes GROUP BY type ORDER BY n DESC"

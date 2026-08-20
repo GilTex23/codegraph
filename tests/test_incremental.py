@@ -6,7 +6,7 @@ from pathlib import Path
 
 from codegraph.config import Config, load_config
 from codegraph.db import Database
-from codegraph.indexer import build
+from codegraph.indexer import build, fingerprint_sources, source_fingerprint
 from codegraph.indexer.walker import hash_text, read_source
 
 
@@ -167,10 +167,10 @@ def test_excluded_directories_are_never_walked(config: Config, summary):
     assert again.parsed == 0
 
 
-def test_a_codegraph_upgrade_forces_one_full_rebuild(config: Config, summary):
-    """Unchanged files are never revisited, so a tool upgrade must reset the graph."""
+def test_a_codegraph_change_forces_one_full_rebuild(config: Config, summary):
+    """Unchanged files are never revisited, so editing the tool must reset the graph."""
     with Database.open(config.db_path) as db:
-        db.set_meta("codegraph_version", "0.0.1-old")
+        db.set_meta("codegraph_build", "written-by-older-code")
         db.conn.commit()
 
     again = build(config)
@@ -182,3 +182,43 @@ def test_a_codegraph_upgrade_forces_one_full_rebuild(config: Config, summary):
     once_more = build(config)
     assert once_more.forced_full is False
     assert once_more.parsed == 0
+
+
+def test_the_build_records_the_fingerprint_of_the_code_that_made_it(config: Config, summary):
+    with Database.open(config.db_path) as db:
+        assert db.get_meta("codegraph_build") == source_fingerprint()
+        assert db.get_meta("codegraph_version")  # kept for humans reading the file
+
+
+def test_the_fingerprint_tracks_source_edits(tmp_path: Path):
+    """Version numbers stand still during editable development; the code does not."""
+    package = tmp_path / "pkg"
+    (package / "sub").mkdir(parents=True)
+    (package / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (package / "sub" / "b.py").write_text("y = 2\n", encoding="utf-8")
+
+    original = fingerprint_sources(package)
+    assert fingerprint_sources(package) == original  # deterministic
+
+    (package / "sub" / "b.py").write_text("y = 3\n", encoding="utf-8")
+    assert fingerprint_sources(package) != original
+
+
+def test_the_fingerprint_ignores_line_endings(tmp_path: Path):
+    """A CRLF checkout of identical code must not look like a different tool."""
+    lf, crlf = tmp_path / "lf", tmp_path / "crlf"
+    lf.mkdir()
+    crlf.mkdir()
+    (lf / "a.py").write_bytes(b"def f():\n    return 1\n")
+    (crlf / "a.py").write_bytes(b"def f():\r\n    return 1\r\n")
+    assert fingerprint_sources(lf) == fingerprint_sources(crlf)
+
+
+def test_the_fingerprint_covers_the_whole_package(tmp_path: Path):
+    """Renaming a file changes the tool even when the bytes are the same."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.py").write_text("x = 1\n", encoding="utf-8")
+    before = fingerprint_sources(package)
+    (package / "a.py").rename(package / "renamed.py")
+    assert fingerprint_sources(package) != before

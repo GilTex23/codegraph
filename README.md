@@ -157,6 +157,9 @@ config path so it works for the whole team; `.codex/config.toml` cannot be
 shared and is ignored.
 
 Rebuild the graph after substantial edits — it is a snapshot, not a live view.
+A build records a fingerprint of codegraph's own sources, so upgrading or
+editing the tool makes the next `codegraph build` rebuild from scratch on its
+own; you never have to remember `--full`.
 A `post-commit` and `post-merge` git hook running `codegraph build` keeps it
 current for a couple of seconds per commit:
 
