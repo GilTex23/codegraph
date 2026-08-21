@@ -121,6 +121,21 @@ END;
 """
 
 
+# Dropped in dependency order: triggers and the FTS index first, then the
+# children, then the tables they point at.
+RESET_SQL = """
+DROP TRIGGER IF EXISTS nodes_fts_ai;
+DROP TRIGGER IF EXISTS nodes_fts_ad;
+DROP TRIGGER IF EXISTS nodes_fts_au;
+DROP TABLE IF EXISTS nodes_fts;
+DROP TABLE IF EXISTS edges;
+DROP TABLE IF EXISTS imports;
+DROP TABLE IF EXISTS nodes;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS meta;
+"""
+
+
 class SchemaVersionError(Exception):
     """Existing database was built by a different schema version."""
 
@@ -151,14 +166,23 @@ class Database:
 
     @classmethod
     def open(cls, path: Path, *, reset: bool = False) -> Database:
-        """Open (creating if needed) a writable graph database."""
+        """Open (creating if needed) a writable graph database.
+
+        ``reset`` empties the graph by dropping its objects rather than by
+        deleting the file.  On Windows an open file cannot be unlinked, and an
+        MCP server serving this project holds the database open read-only for
+        as long as the agent session lives -- so deleting it made a full
+        rebuild fail exactly when the tool was in use.  SQLite is happy to drop
+        and recreate underneath a reader, which sees the old snapshot until the
+        rebuild commits and the new one afterwards.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if reset and path.exists():
-            path.unlink()
         conn = sqlite3.connect(path)
         db = cls(conn, path)
         db._configure()
+        if reset:
+            db._drop_schema()
         db._ensure_schema()
         return db
 
@@ -184,6 +208,23 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
+
+    def _drop_schema(self) -> None:
+        """Empty the graph in place.  Falls back to the file only if that fails."""
+        try:
+            self.conn.executescript(RESET_SQL)
+            self.conn.execute("PRAGMA user_version = 0")
+            self.conn.commit()
+            return
+        except sqlite3.DatabaseError:
+            pass  # unreadable or corrupt: there is nothing to drop cleanly
+
+        self.conn.close()
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+            self.conn = sqlite3.connect(self.path)
+            self.conn.row_factory = sqlite3.Row
+            self._configure()
 
     def _ensure_schema(self) -> None:
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]

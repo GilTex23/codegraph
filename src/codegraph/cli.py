@@ -8,6 +8,7 @@ mismatch) exits with a one-line message rather than a traceback.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -85,6 +86,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
+        return 2
+    except (sqlite3.OperationalError, PermissionError) as error:
+        # Almost always another process holding the graph: an MCP server serving
+        # this project keeps it open for the life of the agent session.
+        print(
+            f"error: cannot use {config.db_path}: {error}\n"
+            f"       Something else is holding it -- an agent's MCP server, or "
+            f"another codegraph. Close it and retry.",
+            file=sys.stderr,
+        )
         return 2
     return 0
 

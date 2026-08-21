@@ -83,3 +83,23 @@ def test_a_stale_schema_asks_for_a_full_rebuild(
     exit_code = main(["stats", "--config", str(config.root)])
     assert exit_code == 2
     assert "codegraph build --full" in capsys.readouterr().err
+
+
+def test_a_locked_database_is_reported_not_traced(
+    project: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+):
+    """The message has to name the likely culprit; a traceback names nothing."""
+    import sqlite3
+
+    import codegraph.indexer
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(codegraph.indexer, "build", locked)
+    exit_code = main(["build", "--config", str(project)])
+    error = capsys.readouterr().err
+    assert exit_code == 2
+    assert "database is locked" in error
+    assert "MCP server" in error
+    assert "Traceback" not in error

@@ -222,3 +222,50 @@ def test_the_fingerprint_covers_the_whole_package(tmp_path: Path):
     before = fingerprint_sources(package)
     (package / "a.py").rename(package / "renamed.py")
     assert fingerprint_sources(package) != before
+
+
+def test_a_full_rebuild_works_while_a_reader_holds_the_database(config: Config, summary):
+    """An MCP server keeps the graph open for the whole agent session.
+
+    Windows refuses to unlink an open file, so a rebuild that deleted the
+    database failed precisely when codegraph was being used. Dropping the
+    objects instead works underneath a reader.
+    """
+    reader = Database.open_readonly(config.db_path)
+    try:
+        before = reader.counts()["nodes"]
+        assert before > 0
+
+        again = build(config, full=True)  # must not raise PermissionError
+        assert again.nodes == summary.nodes
+
+        # The same connection now sees the rebuilt graph, not a stale snapshot.
+        assert reader.counts()["nodes"] == again.nodes
+    finally:
+        reader.close()
+
+
+def test_a_reader_does_not_block_an_incremental_build(config: Config, summary):
+    reader = Database.open_readonly(config.db_path)
+    try:
+        target = config.root / "backend" / "app" / "models" / "task.py"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n\nEXTRA = 1\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        again = build(config)
+        assert again.parsed == 1
+        assert reader.counts()["nodes"] == again.nodes
+    finally:
+        reader.close()
+
+
+def test_a_full_rebuild_recovers_from_a_stale_schema(config: Config, summary):
+    """--full is what the schema-mismatch error tells you to run, so it must work."""
+    with Database.open(config.db_path) as db:
+        db.conn.execute("PRAGMA user_version = 99")
+        db.conn.commit()
+
+    again = build(config, full=True)
+    assert again.nodes == summary.nodes
