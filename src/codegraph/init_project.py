@@ -35,7 +35,7 @@ CLIENTS = ("claude", "codex")
 CODEX_DIR = ".codex"
 CODEX_CONFIG = "config.toml"
 MCP_JSON = ".mcp.json"
-CODEX_TABLE = "[mcp_servers.codegraph]"
+CODEX_TABLE = "mcp_servers.codegraph"
 CODEX_STARTUP_TIMEOUT_SEC = 30
 
 
@@ -421,7 +421,7 @@ def _replace_codex_block(existing: str, block: str) -> str:
     """
     lines = existing.splitlines(keepends=True)
     start = next(
-        (i for i, line in enumerate(lines) if line.strip() == CODEX_TABLE),
+        (i for i, line in enumerate(lines) if line.strip() == "[" + CODEX_TABLE + "]"),
         None,
     )
     if start is None:
@@ -461,7 +461,27 @@ def render_codex_entry(executable: str, config_path: Path, root: Path) -> str:
         f"    {_toml_string(str(config_path))},\n"
         f"]\n"
         f"cwd = {_toml_string(str(root))}\n"
-        f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}\n"
+        f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}\n\n"
+        f"[{CODEX_TABLE}.tools.get_definition]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_directory_outline]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_imports]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_callers]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.trace_endpoint]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_file_outline]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.search_symbol]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_domain_slice]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_change_impact]\n"
+        f"approval_mode = \"approve\"\n\n"
+        f"[{CODEX_TABLE}.tools.get_project_overview]\n"
+        f"approval_mode = \"approve\"\n"
     )
 
 
