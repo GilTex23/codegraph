@@ -452,7 +452,7 @@ def codegraph_executable() -> str:
 def render_codex_entry(executable: str, config_path: Path, root: Path) -> str:
     """The ``[mcp_servers.codegraph]`` table for a project-local Codex config."""
     return (
-        f"{CODEX_TABLE}\n"
+        f"[{CODEX_TABLE}]\n"
         f"enabled = true\n"
         f"command = {_toml_string(executable)}\n"
         f"args = [\n"
