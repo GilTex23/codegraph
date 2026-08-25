@@ -293,6 +293,8 @@ def _gitignore_entries(clients: Sequence[str]) -> list[str]:
     entries = [".codegraph/"]
     if "codex" in clients:
         entries.append(f"{CODEX_DIR}/")
+    if "claude" in clients:
+        entries.append(f"{MCP_JSON}")
     return entries
 
 
