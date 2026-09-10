@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import tomllib
 from pathlib import Path
 
 import pytest
 
+import codegraph
 from codegraph.cli import main
 from codegraph.config import load_config
 from codegraph.indexer import build
-from codegraph.init_project import codegraph_executable, detect, init_project
+from codegraph.init_project import SERVER_TOOLS, codegraph_executable, detect, init_project
 
 
 def make_project(root: Path, *, gitignore: str | None = None, fastapi: bool = True) -> Path:
@@ -49,6 +51,34 @@ def fresh(tmp_path: Path) -> Path:
 def codex_table(root: Path) -> dict:
     data = tomllib.loads((root / ".codex" / "config.toml").read_text(encoding="utf-8"))
     return data["mcp_servers"]["codegraph"]
+
+
+def claude_entry(root: Path) -> dict:
+    data = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+    return data["mcpServers"]["codegraph"]
+
+
+def claude_settings(root: Path) -> dict:
+    return json.loads((root / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+
+
+def registered_tools() -> set[str]:
+    """The tools build_server actually exposes, read off the source.
+
+    Parsed rather than imported: this suite must run without the mcp package,
+    and the point is to catch a tool added to the server and forgotten here.
+    """
+    source = Path(codegraph.__file__).parent / "server" / "mcp_server.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(decorator, ast.Call) and getattr(decorator.func, "attr", None) == "tool"
+            for decorator in node.decorator_list
+        )
+    }
 
 
 # ------------------------------------------------------------------ detection
@@ -157,8 +187,10 @@ def test_an_existing_config_is_only_replaced_with_force(fresh: Path):
 
 def test_no_flags_registers_every_client(fresh: Path):
     result = init_project(fresh)
-    assert [client.name for client in result.clients] == ["claude", "codex"]
+    # Claude takes two files: the server, and the approval that lets it load.
+    assert [client.name for client in result.clients] == ["claude", "claude", "codex"]
     assert (fresh / ".mcp.json").exists()
+    assert (fresh / ".claude" / "settings.local.json").exists()
     assert (fresh / ".codex" / "config.toml").exists()
 
 
@@ -184,13 +216,89 @@ def test_no_clients_writes_only_the_config(fresh: Path):
 # -------------------------------------------------------------- claude / .mcp.json
 
 
-def test_mcp_json_uses_a_relative_config_path(fresh: Path):
-    """.mcp.json gets committed, so an absolute path would break for everyone else."""
+def test_mcp_json_pins_the_executable_and_the_config(fresh: Path):
+    """A desktop app launches the server with the system PATH; a bare name is not found."""
     init_project(fresh, clients=["claude"])
-    data = json.loads((fresh / ".mcp.json").read_text(encoding="utf-8"))
-    entry = data["mcpServers"]["codegraph"]
-    assert entry["command"] == "codegraph"
-    assert entry["args"] == ["serve", "--config", ".codegraph.toml"]
+    entry = claude_entry(fresh)
+    assert entry["type"] == "stdio"
+    assert entry["command"] == codegraph_executable()
+    assert Path(entry["command"]).is_absolute()
+    assert entry["args"] == ["serve", "--config", str(fresh / ".codegraph.toml")]
+    assert Path(entry["args"][2]).is_file()
+
+
+def test_an_existing_mcp_entry_is_refreshed_only_with_force(fresh: Path):
+    init_project(fresh, clients=["claude"])
+    mcp_path = fresh / ".mcp.json"
+    stale = json.loads(mcp_path.read_text(encoding="utf-8"))
+    stale["mcpServers"]["codegraph"]["command"] = "codegraph"
+    mcp_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    init_project(fresh, clients=["claude"])
+    assert claude_entry(fresh)["command"] == "codegraph"  # left alone
+
+    init_project(fresh, clients=["claude"], force=True)
+    assert claude_entry(fresh)["command"] == codegraph_executable()
+
+
+def test_a_stale_entry_is_reported_rather_than_silently_kept(fresh: Path):
+    """An entry from an older codegraph names a bare command this machine cannot resolve."""
+    (fresh / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"codegraph": {"command": "codegraph"}}}), encoding="utf-8"
+    )
+    result = init_project(fresh, clients=["claude"])
+    assert claude_entry(fresh) == {"command": "codegraph"}  # still left alone
+    assert any("--force refreshes it" in note for note in result.notes)
+
+
+# ------------------------------------------------- claude / settings.local.json
+
+
+def test_the_server_is_approved_up_front(fresh: Path):
+    """An unanswered approval prompt looks just like a working setup: no tools, no error."""
+    init_project(fresh, clients=["claude"])
+    assert claude_settings(fresh)["enabledMcpjsonServers"] == ["codegraph"]
+
+
+def test_approval_merges_into_existing_settings(fresh: Path):
+    settings = fresh / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text(
+        json.dumps({"model": "opus", "enabledMcpjsonServers": ["other"]}), encoding="utf-8"
+    )
+    init_project(fresh, clients=["claude"])
+    data = claude_settings(fresh)
+    assert data["model"] == "opus"
+    assert data["enabledMcpjsonServers"] == ["other", "codegraph"]
+
+
+def test_a_rejected_server_is_re_enabled_and_reported(fresh: Path):
+    settings = fresh / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"disabledMcpjsonServers": ["codegraph"]}), encoding="utf-8")
+
+    result = init_project(fresh, clients=["claude"])
+    data = claude_settings(fresh)
+    assert data["disabledMcpjsonServers"] == []
+    assert data["enabledMcpjsonServers"] == ["codegraph"]
+    assert any("re-enabled" in note for note in result.notes)
+
+
+def test_a_blanket_approval_needs_no_entry(fresh: Path):
+    settings = fresh / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"enableAllProjectMcpServers": True}), encoding="utf-8")
+    init_project(fresh, clients=["claude"])
+    assert claude_settings(fresh) == {"enableAllProjectMcpServers": True}
+
+
+def test_malformed_settings_are_left_alone(fresh: Path):
+    settings = fresh / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text("{ not json", encoding="utf-8")
+    result = init_project(fresh, clients=["claude"])
+    assert settings.read_text(encoding="utf-8") == "{ not json"
+    assert any("settings.local.json could not be parsed" in note for note in result.notes)
 
 
 def test_mcp_json_merges_into_an_existing_file(fresh: Path):
@@ -228,6 +336,12 @@ def test_codex_paths_are_absolute_and_real(fresh: Path):
     assert Path(entry["command"]).is_absolute()
     assert Path(entry["args"][2]).is_file()
     assert Path(entry["cwd"]).is_dir()
+
+
+def test_codex_pre_approves_every_tool_the_server_registers(fresh: Path):
+    """A tool missing from the table is one Codex stops and asks about, every time."""
+    init_project(fresh, clients=["codex"])
+    assert set(codex_table(fresh)["tools"]) == set(SERVER_TOOLS) == registered_tools()
 
 
 def test_the_executable_is_this_codegraph(fresh: Path):
@@ -296,31 +410,45 @@ def test_a_malformed_codex_config_is_left_alone(fresh: Path):
 # --------------------------------------------------------------------- ignores
 
 
-def test_gitignore_gains_the_index_and_the_codex_directory(fresh: Path):
+def test_gitignore_gains_the_index_and_every_client_file(fresh: Path):
+    """All of it pins one machine: the executable that ran init, and one user's approval."""
     result = init_project(fresh)
-    assert result.gitignore_added == [".codegraph/", ".codex/"]
+    assert result.gitignore_added == [
+        ".codegraph/",
+        ".codex/",
+        ".mcp.json",
+        ".claude/settings.local.json",
+    ]
     contents = (fresh / ".gitignore").read_text(encoding="utf-8")
-    assert ".codegraph/" in contents and ".codex/" in contents
+    assert ".codegraph/" in contents and ".codex/" in contents and ".mcp.json" in contents
     assert contents.startswith("node_modules/\n.env\n")  # existing entries kept
 
 
-def test_codex_is_not_ignored_when_codex_was_not_selected(fresh: Path):
+def test_only_the_selected_clients_are_ignored(fresh: Path):
     result = init_project(fresh, clients=["claude"])
-    assert result.gitignore_added == [".codegraph/"]
+    assert result.gitignore_added == [".codegraph/", ".mcp.json", ".claude/settings.local.json"]
     assert ".codex" not in (fresh / ".gitignore").read_text(encoding="utf-8")
-
-
-def test_mcp_json_is_never_ignored(fresh: Path):
-    """It holds a relative path precisely so a team can share it."""
-    init_project(fresh)
-    assert ".mcp.json" not in (fresh / ".gitignore").read_text(encoding="utf-8")
 
 
 def test_only_the_missing_entries_are_added(fresh: Path):
     (fresh / ".gitignore").write_text(".codegraph/\n", encoding="utf-8", newline="\n")
-    result = init_project(fresh)
+    result = init_project(fresh, clients=["codex"])
     assert result.gitignore_added == [".codex/"]
     assert (fresh / ".gitignore").read_text(encoding="utf-8").count(".codegraph/") == 1
+
+
+def test_a_directory_line_covers_the_files_beneath_it(fresh: Path):
+    """A project ignoring .claude/ needs no second line for the settings file."""
+    (fresh / ".gitignore").write_text(".claude/\n", encoding="utf-8", newline="\n")
+    result = init_project(fresh, clients=["claude"])
+    assert result.gitignore_added == [".codegraph/", ".mcp.json"]
+    assert "settings.local.json" not in (fresh / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_a_negation_does_not_count_as_coverage(fresh: Path):
+    (fresh / ".gitignore").write_text("!.mcp.json\n", encoding="utf-8", newline="\n")
+    result = init_project(fresh, clients=["claude"])
+    assert ".mcp.json" in result.gitignore_added
 
 
 def test_a_second_run_extends_the_section_instead_of_repeating_the_heading(fresh: Path):
@@ -340,10 +468,11 @@ def test_gitignore_is_never_created_when_absent(tmp_path: Path):
 
 
 def test_gitignore_is_left_alone_when_already_covered(fresh: Path):
-    (fresh / ".gitignore").write_text(".codegraph/\n.codex/\n", encoding="utf-8", newline="\n")
+    covered = ".codegraph/\n.codex/\n.mcp.json\n.claude/\n"
+    (fresh / ".gitignore").write_text(covered, encoding="utf-8", newline="\n")
     result = init_project(fresh)
     assert result.gitignore_added == []
-    assert (fresh / ".gitignore").read_text(encoding="utf-8") == ".codegraph/\n.codex/\n"
+    assert (fresh / ".gitignore").read_text(encoding="utf-8") == covered
 
 
 def test_no_gitignore_flag_is_respected(fresh: Path):
@@ -359,6 +488,7 @@ def test_running_twice_changes_nothing(fresh: Path):
     watched = (
         fresh / ".codegraph.toml",
         fresh / ".mcp.json",
+        fresh / ".claude" / "settings.local.json",
         fresh / ".gitignore",
         fresh / ".codex" / "config.toml",
     )
@@ -380,9 +510,13 @@ def test_cli_init_reports_what_it_did(fresh: Path, capsys: pytest.CaptureFixture
     assert "include:  backend/, frontend/src/" in output
     assert "wrote .codegraph.toml" in output
     assert "registered for claude in .mcp.json" in output
+    assert "approved for claude in .claude/settings.local.json" in output
     assert "registered for codex in .codex/config.toml" in output
-    assert "added .codegraph/, .codex/ to .gitignore" in output
+    assert (
+        "added .codegraph/, .codex/, .mcp.json, .claude/settings.local.json to .gitignore" in output
+    )
     assert "next: codegraph build" in output
+    assert "restart the agent" in output
 
 
 @pytest.mark.parametrize(

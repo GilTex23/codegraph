@@ -32,11 +32,34 @@ GITIGNORE_HEADER = "# codegraph index"
 # Agent clients init can register the MCP server with.
 CLIENTS = ("claude", "codex")
 
+SERVER_NAME = "codegraph"
+
 CODEX_DIR = ".codex"
 CODEX_CONFIG = "config.toml"
-MCP_JSON = ".mcp.json"
-CODEX_TABLE = "mcp_servers.codegraph"
+CODEX_TABLE = f"mcp_servers.{SERVER_NAME}"
 CODEX_STARTUP_TIMEOUT_SEC = 30
+
+MCP_JSON = ".mcp.json"
+CLAUDE_DIR = ".claude"
+CLAUDE_SETTINGS = "settings.local.json"
+
+# Every tool ``build_server`` registers. Codex prompts before each tool it does
+# not know, so the config it gets pre-approves the lot; a test keeps this list
+# in step with the server.
+SERVER_TOOLS = (
+    "search_symbol",
+    "get_definition",
+    "get_callers",
+    "get_callees",
+    "get_file_outline",
+    "get_directory_outline",
+    "get_change_impact",
+    "get_imports",
+    "get_neighbors",
+    "get_project_overview",
+    "get_domain_slice",
+    "trace_endpoint",
+)
 
 
 @dataclass(slots=True)
@@ -81,12 +104,15 @@ class Detected:
 
 @dataclass(slots=True)
 class ClientResult:
-    """Outcome of registering the MCP server with one agent client."""
+    """Outcome of writing one file on one agent client's behalf."""
 
     name: str
     path: Path
     written: bool = False
     already_present: bool = False
+    # What the file does, for the report: a client can need more than
+    # registration -- Claude Code also has to be told the server is approved.
+    label: str = "registered"
 
 
 @dataclass(slots=True)
@@ -266,7 +292,7 @@ def init_project(
         result.config_written = True
 
     if "claude" in wanted:
-        _apply_claude(root, result)
+        _apply_claude(root, config_path, force, result)
     if "codex" in wanted:
         _apply_codex(root, config_path, force, result)
 
@@ -286,15 +312,17 @@ def init_project(
 def _gitignore_entries(clients: Sequence[str]) -> list[str]:
     """What this run produced that must not reach version control.
 
-    ``.mcp.json`` is deliberately absent: it holds a relative config path
-    precisely so a team can share it. ``.codex/config.toml`` cannot be shared --
-    it pins absolute paths to one machine's interpreter and checkout.
+    None of it can be shared. Both client configs pin absolute paths to one
+    machine's interpreter and checkout -- they name the executable that ran
+    ``init`` -- and ``.claude/settings.local.json`` additionally records one
+    user's approval of a server the rest of the team may not want.
     """
     entries = [".codegraph/"]
     if "codex" in clients:
         entries.append(f"{CODEX_DIR}/")
     if "claude" in clients:
-        entries.append(f"{MCP_JSON}")
+        entries.append(MCP_JSON)
+        entries.append(f"{CLAUDE_DIR}/{CLAUDE_SETTINGS}")
     return entries
 
 
@@ -316,8 +344,8 @@ def _apply_gitignore(root: Path, entries: Iterable[str], result: InitResult) -> 
         result.notes.append(f".gitignore could not be read: {error}")
         return
 
-    present = {line.strip().rstrip("/") for line in existing.splitlines()}
-    missing = [entry for entry in entries if entry.rstrip("/") not in present]
+    lines = existing.splitlines()
+    missing = [entry for entry in entries if not _is_ignored_already(entry, lines)]
     if not missing:
         return
 
@@ -335,21 +363,48 @@ def _apply_gitignore(root: Path, entries: Iterable[str], result: InitResult) -> 
     result.gitignore_added = missing
 
 
+def _is_ignored_already(entry: str, lines: Iterable[str]) -> bool:
+    """Whether a .gitignore line already covers this path.
+
+    A directory line covers everything beneath it: a project that ignores
+    ``.claude/`` needs no second line for ``.claude/settings.local.json``.
+    Negations are skipped -- a ``!`` line is the opposite of coverage.
+    """
+    target = entry.strip().strip("/")
+    for line in lines:
+        pattern = line.strip()
+        if not pattern or pattern.startswith(("#", "!")):
+            continue
+        pattern = pattern.strip("/")
+        if not pattern:
+            continue
+        if target == pattern or target.startswith(f"{pattern}/"):
+            return True
+    return False
+
+
 # --------------------------------------------------------------------- clients
 
 
-def _apply_claude(root: Path, result: InitResult) -> None:
-    """Register the server in project-scoped .mcp.json, which Claude Code reads."""
+def _apply_claude(root: Path, config_path: Path, force: bool, result: InitResult) -> None:
+    """Register the server in project-scoped .mcp.json, which Claude Code reads.
+
+    Every path is absolute and ``command`` names the executable that ran
+    ``init``, for the same reason the Codex entry does: a desktop app launches
+    the server with the system PATH and knows nothing about the virtualenv
+    codegraph was installed into, so a bare ``codegraph`` is simply not found
+    and the server dies before it can say why. That pins the file to one
+    machine, which is why ``init`` gitignores it.
+    """
     mcp_path = root / MCP_JSON
     client = ClientResult(name="claude", path=mcp_path)
     result.clients.append(client)
 
-    # A relative config path keeps the file portable -- .mcp.json is usually
-    # committed, and an absolute path would break for everyone else. Clients
-    # launch project servers with the project root as the working directory; if
-    # one does not, serve fails with a clear "config not found" instead of
-    # silently walking up into some other project.
-    entry = {"command": "codegraph", "args": ["serve", "--config", CONFIG_FILENAME]}
+    entry = {
+        "type": "stdio",
+        "command": codegraph_executable(),
+        "args": ["serve", "--config", str(config_path)],
+    }
 
     if mcp_path.exists():
         try:
@@ -357,18 +412,91 @@ def _apply_claude(root: Path, result: InitResult) -> None:
         except (OSError, ValueError) as error:
             result.notes.append(f"{MCP_JSON} exists but could not be parsed ({error}); left alone")
             return
+        if not isinstance(data, dict):
+            result.notes.append(f"{MCP_JSON} has an unexpected shape; left alone")
+            return
         servers = data.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
             result.notes.append(f"{MCP_JSON} has an unexpected shape; left alone")
             return
-        if "codegraph" in servers:
+        if SERVER_NAME in servers and not force:
             client.already_present = True
+            if servers[SERVER_NAME] != entry:
+                # Most often an entry from an older codegraph, naming a bare
+                # `codegraph` that this machine cannot resolve. Saying nothing
+                # would leave a registration that looks done and never starts.
+                result.notes.append(
+                    f"{MCP_JSON} lists codegraph with different settings; --force refreshes it "
+                    f"(and rewrites {CONFIG_FILENAME})"
+                )
+            _apply_claude_settings(root, result)
             return
-        servers["codegraph"] = entry
+        # --force refreshes an entry whose paths a moved venv or checkout has
+        # invalidated -- the same reason it refreshes the Codex table.
+        servers[SERVER_NAME] = entry
     else:
-        data = {"mcpServers": {"codegraph": entry}}
+        data = {"mcpServers": {SERVER_NAME: entry}}
 
-    mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+    try:
+        mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+    except OSError as error:
+        result.notes.append(f"{MCP_JSON} could not be written: {error}")
+        return
+    client.written = True
+    _apply_claude_settings(root, result)
+
+
+def _apply_claude_settings(root: Path, result: InitResult) -> None:
+    """Approve the server up front in .claude/settings.local.json.
+
+    A server declared in ``.mcp.json`` does not load until the user approves
+    it, and an unanswered prompt looks exactly like a working setup: the agent
+    reads files instead and never mentions the graph. ``enabledMcpjsonServers``
+    is that answer in written form. It belongs in the *local* settings file
+    because it is one user's decision about one machine's checkout -- the same
+    reason ``.mcp.json`` itself is no longer shareable.
+    """
+    settings_path = root / CLAUDE_DIR / CLAUDE_SETTINGS
+    client = ClientResult(name="claude", path=settings_path, label="approved")
+    result.clients.append(client)
+    where = f"{CLAUDE_DIR}/{CLAUDE_SETTINGS}"
+
+    data: dict = {}
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            result.notes.append(f"{where} could not be parsed ({error}); left alone")
+            return
+        if not isinstance(data, dict):
+            result.notes.append(f"{where} has an unexpected shape; left alone")
+            return
+
+    enabled = data.get("enabledMcpjsonServers", [])
+    disabled = data.get("disabledMcpjsonServers", [])
+    if not isinstance(enabled, list) or not isinstance(disabled, list):
+        result.notes.append(f"{where} lists MCP servers in an unexpected shape; left alone")
+        return
+
+    rejected = SERVER_NAME in disabled
+    if not rejected and (data.get("enableAllProjectMcpServers") is True or SERVER_NAME in enabled):
+        client.already_present = True
+        return
+
+    if rejected:
+        # A standing rejection is a decision, but running `init` is a newer one
+        # saying the opposite. Flip it, and report the flip.
+        data["disabledMcpjsonServers"] = [name for name in disabled if name != SERVER_NAME]
+        result.notes.append(f"{where} listed {SERVER_NAME} as rejected; re-enabled")
+    if SERVER_NAME not in enabled:
+        data["enabledMcpjsonServers"] = [*enabled, SERVER_NAME]
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+    except OSError as error:
+        result.notes.append(f"{where} could not be written: {error}")
+        return
     client.written = True
 
 
@@ -430,10 +558,16 @@ def _replace_codex_block(existing: str, block: str) -> str:
         return _append_block(existing, block)
     end = len(lines)
     for index in range(start + 1, len(lines)):
-        if lines[index].startswith("["):
+        heading = lines[index].strip()
+        # The per-tool approval tables are part of our block; stop at the first
+        # heading belonging to someone else, or the old tables survive the
+        # replacement and TOML rejects a file that declares them twice.
+        if heading.startswith("[") and not heading.startswith(f"[{CODEX_TABLE}."):
             end = index
             break
-    return "".join(lines[:start]) + block + "".join(lines[end:])
+    tail = "".join(lines[end:])
+    separator = "\n" if tail and not block.endswith("\n\n") else ""
+    return "".join(lines[:start]) + block + separator + tail
 
 
 def codegraph_executable() -> str:
@@ -453,7 +587,7 @@ def codegraph_executable() -> str:
 
 def render_codex_entry(executable: str, config_path: Path, root: Path) -> str:
     """The ``[mcp_servers.codegraph]`` table for a project-local Codex config."""
-    return (
+    header = (
         f"[{CODEX_TABLE}]\n"
         f"enabled = true\n"
         f"command = {_toml_string(executable)}\n"
@@ -463,28 +597,12 @@ def render_codex_entry(executable: str, config_path: Path, root: Path) -> str:
         f"    {_toml_string(str(config_path))},\n"
         f"]\n"
         f"cwd = {_toml_string(str(root))}\n"
-        f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}\n\n"
-        f"[{CODEX_TABLE}.tools.get_definition]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_directory_outline]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_imports]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_callers]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.trace_endpoint]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_file_outline]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.search_symbol]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_domain_slice]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_change_impact]\n"
-        f"approval_mode = \"approve\"\n\n"
-        f"[{CODEX_TABLE}.tools.get_project_overview]\n"
-        f"approval_mode = \"approve\"\n"
+        f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}\n"
     )
+    approvals = "".join(
+        f'\n[{CODEX_TABLE}.tools.{tool}]\napproval_mode = "approve"\n' for tool in SERVER_TOOLS
+    )
+    return header + approvals
 
 
 def _toml_string(value: str) -> str:
@@ -511,7 +629,7 @@ def render_report(result: InitResult) -> str:
     for client in result.clients:
         where = client.path.relative_to(result.config_path.parent).as_posix()
         if client.written:
-            lines.append(f"registered for {client.name} in {where}")
+            lines.append(f"{client.label} for {client.name} in {where}")
         elif client.already_present:
             lines.append(f"{where} already lists codegraph")
     if result.gitignore_added:
@@ -521,4 +639,8 @@ def render_report(result: InitResult) -> str:
     lines.extend(f"note: {note}" for note in result.notes)
     lines.append("")
     lines.append("next: codegraph build")
+    if any(client.name == "claude" for client in result.clients):
+        # A server is read once, at startup: a session already running keeps
+        # the tool list it began with, and init looks like it did nothing.
+        lines.append("      then restart the agent -- MCP servers are read at startup")
     return "\n".join(lines)

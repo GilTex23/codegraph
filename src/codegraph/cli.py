@@ -32,7 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("path", nargs="?", type=Path, default=Path("."), help="project root")
     init.add_argument("--force", action="store_true", help="replace an existing config")
     init.add_argument("--no-gitignore", action="store_true", help="do not touch .gitignore")
-    init.add_argument("--claude", action="store_true", help="register for Claude Code in .mcp.json")
+    init.add_argument(
+        "--claude",
+        action="store_true",
+        help="register for Claude Code in .mcp.json and approve it in .claude/",
+    )
     init.add_argument(
         "--codex", action="store_true", help="register for Codex in .codex/config.toml"
     )
