@@ -322,7 +322,7 @@ def _gitignore_entries(clients: Sequence[str]) -> list[str]:
         entries.append(f"{CODEX_DIR}/")
     if "claude" in clients:
         entries.append(MCP_JSON)
-        entries.append(f"{CLAUDE_DIR}/{CLAUDE_SETTINGS}")
+        entries.append(f"{CLAUDE_DIR}/")
     return entries
 
 
