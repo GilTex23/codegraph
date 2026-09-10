@@ -55,6 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
     stats = subparsers.add_parser("stats", help="what is in the graph")
     stats.add_argument("--config", type=Path, help="path to .codegraph.toml")
 
+    guidance = subparsers.add_parser(
+        "instructions", help="the block telling an agent this repo has a graph"
+    )
+    guidance.add_argument("--config", type=Path, help="path to .codegraph.toml")
+    guidance.add_argument(
+        "--write",
+        nargs="?",
+        const="",
+        metavar="FILE",
+        help="insert it into an agent file (AGENTS.md, CLAUDE.md) instead of printing it",
+    )
+
     query = subparsers.add_parser("query", help="look a symbol up without an agent")
     query.add_argument("symbol")
     query.add_argument("--config", type=Path, help="path to .codegraph.toml")
@@ -83,6 +95,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_serve(config)
         if args.command == "stats":
             return _cmd_stats(config)
+        if args.command == "instructions":
+            return _cmd_instructions(config, args.write)
         if args.command == "query":
             return _cmd_query(config, args.symbol, definition=args.definition)
     except SchemaVersionError as error:
@@ -127,6 +141,43 @@ def _cmd_init(args: argparse.Namespace) -> int:
         clients=clients,
     )
     print(render_report(result))
+    return 0
+
+
+def _cmd_instructions(config: Config, target: str | None) -> int:
+    from .instructions import claude_reads, default_target, render, write_block
+
+    block = render(config)
+    if target is None:
+        print(block, end="")
+        return 0
+
+    if target == "":
+        path = default_target(config.root)
+        if path is None:
+            print(
+                "error: no AGENTS.md or CLAUDE.md here\n"
+                "       create one, or name a file: codegraph instructions --write FILE",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        path = Path(target)
+        if not path.is_absolute():
+            path = config.root / path
+        if not path.is_file():
+            # An agent file is someone's own writing; codegraph adds to it, and
+            # only where there is already something to add to.
+            print(f"error: not a file: {path}", file=sys.stderr)
+            return 2
+
+    refreshed = write_block(path, block)
+    print(f"{'refreshed' if refreshed else 'added'} the codegraph block in {path.name}")
+    if not claude_reads(config.root, path):
+        print(
+            f"note: Claude Code reads CLAUDE.md, not {path.name}; "
+            f"put a line `@{path.name}` in CLAUDE.md so it loads this"
+        )
     return 0
 
 

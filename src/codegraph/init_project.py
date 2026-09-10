@@ -643,4 +643,5 @@ def render_report(result: InitResult) -> str:
         # A server is read once, at startup: a session already running keeps
         # the tool list it began with, and init looks like it did nothing.
         lines.append("      then restart the agent -- MCP servers are read at startup")
+    lines.append("      optional: codegraph instructions -- guidance for an AGENTS.md")
     return "\n".join(lines)

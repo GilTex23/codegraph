@@ -13,7 +13,13 @@ import codegraph
 from codegraph.cli import main
 from codegraph.config import load_config
 from codegraph.indexer import build
-from codegraph.init_project import SERVER_TOOLS, codegraph_executable, detect, init_project
+from codegraph.init_project import (
+    SERVER_TOOLS,
+    _is_ignored_already,
+    codegraph_executable,
+    detect,
+    init_project,
+)
 
 
 def make_project(root: Path, *, gitignore: str | None = None, fastapi: bool = True) -> Path:
@@ -413,12 +419,7 @@ def test_a_malformed_codex_config_is_left_alone(fresh: Path):
 def test_gitignore_gains_the_index_and_every_client_file(fresh: Path):
     """All of it pins one machine: the executable that ran init, and one user's approval."""
     result = init_project(fresh)
-    assert result.gitignore_added == [
-        ".codegraph/",
-        ".codex/",
-        ".mcp.json",
-        ".claude/settings.local.json",
-    ]
+    assert result.gitignore_added == [".codegraph/", ".codex/", ".mcp.json", ".claude/"]
     contents = (fresh / ".gitignore").read_text(encoding="utf-8")
     assert ".codegraph/" in contents and ".codex/" in contents and ".mcp.json" in contents
     assert contents.startswith("node_modules/\n.env\n")  # existing entries kept
@@ -426,7 +427,7 @@ def test_gitignore_gains_the_index_and_every_client_file(fresh: Path):
 
 def test_only_the_selected_clients_are_ignored(fresh: Path):
     result = init_project(fresh, clients=["claude"])
-    assert result.gitignore_added == [".codegraph/", ".mcp.json", ".claude/settings.local.json"]
+    assert result.gitignore_added == [".codegraph/", ".mcp.json", ".claude/"]
     assert ".codex" not in (fresh / ".gitignore").read_text(encoding="utf-8")
 
 
@@ -437,12 +438,19 @@ def test_only_the_missing_entries_are_added(fresh: Path):
     assert (fresh / ".gitignore").read_text(encoding="utf-8").count(".codegraph/") == 1
 
 
-def test_a_directory_line_covers_the_files_beneath_it(fresh: Path):
-    """A project ignoring .claude/ needs no second line for the settings file."""
-    (fresh / ".gitignore").write_text(".claude/\n", encoding="utf-8", newline="\n")
+def test_a_directory_line_covers_the_files_beneath_it():
+    """An entry under a directory somebody already ignores needs no line of its own."""
+    lines = ["# notes", ".claude/", "!keep.md"]
+    assert _is_ignored_already(".claude/settings.local.json", lines)
+    assert _is_ignored_already(".claude/", lines)
+    assert not _is_ignored_already("keep.md", lines)
+
+
+def test_an_entry_already_there_is_not_repeated(fresh: Path):
+    (fresh / ".gitignore").write_text(".claude\n", encoding="utf-8", newline="\n")
     result = init_project(fresh, clients=["claude"])
     assert result.gitignore_added == [".codegraph/", ".mcp.json"]
-    assert "settings.local.json" not in (fresh / ".gitignore").read_text(encoding="utf-8")
+    assert (fresh / ".gitignore").read_text(encoding="utf-8").count(".claude") == 1
 
 
 def test_a_negation_does_not_count_as_coverage(fresh: Path):
@@ -512,9 +520,7 @@ def test_cli_init_reports_what_it_did(fresh: Path, capsys: pytest.CaptureFixture
     assert "registered for claude in .mcp.json" in output
     assert "approved for claude in .claude/settings.local.json" in output
     assert "registered for codex in .codex/config.toml" in output
-    assert (
-        "added .codegraph/, .codex/, .mcp.json, .claude/settings.local.json to .gitignore" in output
-    )
+    assert "added .codegraph/, .codex/, .mcp.json, .claude/ to .gitignore" in output
     assert "next: codegraph build" in output
     assert "restart the agent" in output
 

@@ -65,6 +65,7 @@ files are skipped by content hash. Use `--full` to rebuild from scratch.
 codegraph init           # detect the layout and write the config
 codegraph stats          # what ended up in the graph
 codegraph query Task     # search without an agent, for debugging
+codegraph instructions   # the block telling an agent this repo has a graph
 codegraph serve          # MCP server on stdio
 ```
 
@@ -203,6 +204,36 @@ current for a couple of seconds per commit:
 printf '#!/bin/sh\ncodegraph build >/dev/null 2>&1 || true\n' > .git/hooks/post-commit
 chmod +x .git/hooks/post-commit
 ```
+
+## Telling the agent the graph exists
+
+A connected client already gets the server's own instructions and every tool's
+"reach for me when..." docstring, so in principle nothing else is needed. What a
+repo file adds is the part codegraph can measure and you should not have to
+maintain by hand:
+
+```bash
+codegraph instructions                     # print the block
+codegraph instructions --write AGENTS.md   # insert it between markers
+```
+
+Once a graph is built, the block argues its case with this project's own
+numbers, not a claim:
+
+| File | `Read` | `get_file_outline` |
+| --- | --- | --- |
+| `frontend/src/pages/Scheduler.tsx` | ~34k tokens | ~1.4k tokens |
+
+`--write` without a filename picks the `AGENTS.md` or `CLAUDE.md` already in the
+project. It never creates one — an agent file is someone's own writing — and a
+second run replaces the block between `<!-- codegraph:start -->` and
+`<!-- codegraph:end -->` instead of appending a second copy, so refreshing the
+numbers after a big change is one command. Claude Code reads `CLAUDE.md` and not
+`AGENTS.md`; if you write to `AGENTS.md` and no `CLAUDE.md` imports it with
+`@AGENTS.md`, the command tells you the block will not be loaded.
+
+Keep it short around the block: an agent file is read at the start of every
+session, and everything in it competes for the same context as the work.
 
 ## MCP tools
 

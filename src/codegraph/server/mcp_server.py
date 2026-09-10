@@ -28,6 +28,10 @@ Prefer these tools over reading files. Typical flow:
   get_change_impact        -> what am I editing, and what does it break
   trace_endpoint           -> follow one HTTP route end to end
 
+A result tagged `[heuristic]` is a name match rather than a proven link --
+confirm it before acting on it. `third-party` means the symbol comes from a
+library and is not in the graph.
+
 The graph is a snapshot; re-run `codegraph build` after large edits.
 """
 
