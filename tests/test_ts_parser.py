@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from codegraph.indexer.ts_parser import parse_typescript
+from codegraph.indexer.ts_parser import parse_tree, parse_typescript
 
 TS_SOURCE = """\
 import React, { useState } from 'react';
@@ -237,3 +237,34 @@ def test_several_such_members_in_a_row_are_all_recovered():
 def test_a_genuinely_broken_file_is_not_silently_repaired():
     result = parse_typescript("src/bad.ts", "export function broken( { const ;;;\n", "typescript")
     assert result.errors
+
+
+def test_ampersands_in_jsx_keep_the_original_text_and_expression_operators():
+    source = (
+        'export function Report(flags: number) {\n'
+        '  return <p title="R&D" data-link="/docs?a=1&b=2">\n'
+        '    Прибыль (P&L), A&B & C &amp; D {flags & 1 && total()}\n'
+        '  </p>\n'
+        '}\n'
+        'export function next() { return load() }\n'
+    )
+    data = source.encode("utf-8")
+    tree, buffer = parse_tree("tsx", data)
+    assert not tree.root_node.has_error
+    assert buffer == data
+    for token, node_type in [(b"&amp;", "html_character_reference"), (b"& 1", "&"), (b"&&", "&&")]:
+        pos = data.index(token)
+        assert tree.root_node.descendant_for_byte_range(pos, pos + 1).type == node_type
+
+    result = parse_typescript("report.tsx", source, "tsx")
+    nodes = nodes_by_name(result)
+    assert nodes["Report"].type == "component"
+    assert nodes["next"].line_start == 6
+    assert any(
+        e.src_local == nodes["Report"].local_id and e.dst_name == "total" for e in result.edges
+    )
+
+
+def test_jsx_text_recovery_preserves_real_expression_errors():
+    source = "export const Page = () => <p>P&L\n{flags & }\n</p>"
+    assert "page.tsx:2: syntax error" in parse_typescript("page.tsx", source, "tsx").errors

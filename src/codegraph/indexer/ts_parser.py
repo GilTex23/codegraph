@@ -16,6 +16,7 @@ counted and reported rather than aborting the build.
 from __future__ import annotations
 
 import functools
+import re
 
 from tree_sitter import Language, Node, Parser, Tree
 
@@ -44,6 +45,38 @@ def _parser_for(kind: str) -> Parser:
 
 
 MAX_REPAIRS = 30
+_BARE_AMPERSAND = re.compile(rb"&(?!(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#[xX][0-9A-Fa-f]+);)")
+
+
+def _parse_buffer(parser: Parser, data: bytes, kind: str) -> Tree:
+    tree = parser.parse(data)
+    if kind != "tsx" or not tree.root_node.has_error or b"&" not in data:
+        return tree
+
+    # A bare ampersand in JSX text or a quoted attribute can derail the grammar
+    # before it recognizes the enclosing element. A same-width probe recovers
+    # those boundaries. Keep operators in expressions intact in the final parse.
+    probe_data = _BARE_AMPERSAND.sub(b"|", data)
+    if probe_data == data:
+        return tree
+    probe = parser.parse(probe_data).root_node
+    masked = bytearray(data)
+    for match in _BARE_AMPERSAND.finditer(data):
+        pos = match.start()
+        leaf = probe.descendant_for_byte_range(pos, pos + 1)
+        if leaf.type == "string_fragment":
+            string = leaf.parent
+            if string is None or string.parent is None or string.parent.type != "jsx_attribute":
+                continue
+        elif leaf.type != "jsx_text":
+            continue
+        masked[pos] = ord("|")
+
+    if masked != data:
+        recovered = parser.parse(bytes(masked))
+        if _repair_score(recovered) < _repair_score(tree):
+            return recovered
+    return tree
 
 
 def parse_tree(kind: str, data: bytes) -> tuple[Tree, bytes]:
@@ -67,7 +100,7 @@ def parse_tree(kind: str, data: bytes) -> tuple[Tree, bytes]:
     names and signatures stay consistent with the tree.
     """
     parser = _parser_for(kind)
-    tree = parser.parse(data)
+    tree = _parse_buffer(parser, data, kind)
     if not tree.root_node.has_error:
         return tree, data
 
@@ -75,7 +108,7 @@ def parse_tree(kind: str, data: bytes) -> tuple[Tree, bytes]:
     for _ in range(MAX_REPAIRS):
         best: tuple[tuple[int, int], Tree, bytes] | None = None
         for candidate in _repair_candidates(data, tree):
-            candidate_tree = parser.parse(candidate)
+            candidate_tree = _parse_buffer(parser, candidate, kind)
             candidate_score = _repair_score(candidate_tree)
             if best is None or candidate_score < best[0]:
                 best = (candidate_score, candidate_tree, candidate)
