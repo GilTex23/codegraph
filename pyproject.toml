@@ -8,18 +8,21 @@ version = "0.1.0"
 description = "Local code-graph indexer with an MCP server, for token-efficient codebase exploration by AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 dependencies = [
     "tree-sitter>=0.24",
     "tree-sitter-typescript>=0.23",
     "tree-sitter-php>=0.23",
     "mcp>=2.0.0",
+    "puretiktoken>=0.2.1,<1",
 ]
 
 [project.optional-dependencies]
+semantic = ["jedi>=0.19.2,<0.20"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    "jedi>=0.19.2,<0.20",
 ]
 
 [project.scripts]

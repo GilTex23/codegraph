@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..db import Database
+from .python_semantics import PythonSemantics
 
 MAX_REEXPORT_DEPTH = 4
 
@@ -105,6 +106,7 @@ class _File:
     id: int
     path: str
     language: str
+    content_hash: str
     imports: list[_Import] = field(default_factory=list)
 
     @property
@@ -122,9 +124,9 @@ class ResolveStats:
     dropped_builtins: int = 0
 
 
-def resolve(db: Database, root: Path) -> ResolveStats:
+def resolve(db: Database, root: Path, semantics: PythonSemantics | None = None) -> ResolveStats:
     """Recompute every edge target.  Returns counts for the build summary."""
-    return _Resolver(db, root).run()
+    return _Resolver(db, root).run(semantics)
 
 
 class _Resolver:
@@ -144,7 +146,7 @@ class _Resolver:
 
     # ------------------------------------------------------------------- run
 
-    def run(self) -> ResolveStats:
+    def run(self, semantics: PythonSemantics | None = None) -> ResolveStats:
         self._load()
         self._load_tsconfig()
         stats = ResolveStats()
@@ -156,10 +158,11 @@ class _Resolver:
             updates: list[tuple[int, str, int]] = []
             externals: list[tuple[int]] = []
             rows = conn.execute(
-                "SELECT e.id, e.src_id, e.dst_name, e.dst_full, e.type, n.file_id "
+                "SELECT e.id, e.src_id, e.dst_name, e.dst_full, e.receiver_type, e.type, "
+                "e.line, n.file_id "
                 "FROM edges e JOIN nodes n ON n.id = e.src_id "
                 "WHERE e.type IN ('calls','inherits','decorates','implements',"
-                "'references','imports')"
+                "'references','imports') ORDER BY n.file_id, e.id"
             ).fetchall()
 
             for row in rows:
@@ -179,8 +182,29 @@ class _Resolver:
                     )
                 else:
                     target, confidence = self._resolve_symbol_edge(
-                        source_file, row["src_id"], row["dst_name"], row["dst_full"]
+                        source_file,
+                        row["src_id"],
+                        row["dst_name"],
+                        row["dst_full"],
+                        row["receiver_type"],
                     )
+                    if (
+                        semantics
+                        and source_file.language == "python"
+                        and row["type"] == "calls"
+                        and row["dst_full"] != row["dst_name"]
+                        and row["dst_name"] in self.by_name
+                        and (target is None or confidence == "heuristic")
+                    ):
+                        inferred = semantics.target(
+                            self.db,
+                            source_file.path,
+                            source_file.content_hash,
+                            row["line"],
+                            row["dst_name"],
+                        )
+                        if inferred is not None:
+                            target, confidence = inferred, "heuristic"
                 if target is None:
                     stats.unresolved += 1
                     if confidence == "external":
@@ -223,8 +247,8 @@ class _Resolver:
 
     def _load(self) -> None:
         conn = self.db.conn
-        for row in conn.execute("SELECT id, path, language FROM files"):
-            file = _File(id=row["id"], path=row["path"], language=row["language"])
+        for row in conn.execute("SELECT id, path, language, content_hash FROM files"):
+            file = _File(**dict(row))
             self.files[file.id] = file
             self.file_by_path[file.path] = file
             self.file_by_lower[file.path.lower()] = file
@@ -322,16 +346,36 @@ class _Resolver:
         return self.module_node.get(target.id) if target else None
 
     def _resolve_symbol_edge(
-        self, source: _File, src_id: int, dst_name: str, dst_full: str | None
+        self,
+        source: _File,
+        src_id: int,
+        dst_name: str,
+        dst_full: str | None,
+        receiver_type: str | None,
     ) -> tuple[int | None, str]:
         # 0. `self.method()` inside a class: prefer a sibling member.
-        if dst_full and dst_full.startswith(("self.", "this.")):
+        member = dst_full is not None and dst_full != dst_name
+        if dst_full in (f"self.{dst_name}", f"this.{dst_name}", f"$this.{dst_name}"):
             sibling = self._sibling_member(src_id, dst_name)
             if sibling is not None:
                 return sibling, "exact"
 
         # 1. Same file.
-        local = self._in_file(source.id, dst_name)
+        if receiver_type:
+            class_id = self._find_symbol(source, receiver_type, 0, set())
+            owner = self.nodes.get(class_id) if class_id is not None else None
+            if owner and owner.type == "class":
+                methods = [
+                    n
+                    for n in self.nodes_by_file[owner.file_id]
+                    if n.parent_id == owner.id and n.name == dst_name and n.type == "method"
+                ]
+                if len(methods) == 1:
+                    # An annotation supplies a static candidate. Runtime dispatch may override it.
+                    return methods[0].id, "heuristic"
+            return None, "exact"
+
+        local = None if member else self._in_file(source.id, dst_name)
         if local is not None:
             return local.id, "exact"
 
@@ -339,6 +383,8 @@ class _Resolver:
         imported, external = self._via_import(source, dst_name, dst_full)
         if imported is not None:
             return imported, "exact"
+        if external:
+            return None, "external"
 
         # 3. Globally unique name -- but only within the same language.  A
         # Python `db.add(...)` must never land on a TypeScript `add` just
@@ -348,10 +394,12 @@ class _Resolver:
             node for node in self.by_name.get(dst_name, []) if self._same_language(source, node)
         ]
         if len(candidates) == 1:
+            if member and candidates[0].id == src_id:
+                return None, "exact"
             # PHP has a single global namespace for functions and classes, so a
             # project-wide unique name is not a guess -- it is how the language
             # resolves the call at runtime.
-            certain = source.language == "php" and candidates[0].parent_id is None
+            certain = not member and source.language == "php" and candidates[0].parent_id is None
             return candidates[0].id, "exact" if certain else "heuristic"
 
         # 4. Nothing -- but say so precisely.  A name imported from a module
@@ -396,7 +444,7 @@ class _Resolver:
             for n in matches
             if n.parent_id is None or self.nodes.get(n.parent_id, _NULL).type == "module"
         ]
-        return (top_level or matches)[0]
+        return top_level[0] if len(top_level) == 1 else None
 
     def _via_import(
         self, source: _File, dst_name: str, dst_full: str | None
@@ -411,7 +459,7 @@ class _Resolver:
         for imp in source.imports:
             if imp.symbol in (None, "*"):
                 continue
-            if imp.local_name != dst_name:
+            if imp.local_name != dst_name or dst_full not in (None, dst_name):
                 continue
             target = self._resolve_module(source, _raw_module(imp))
             if target is None:
@@ -423,12 +471,10 @@ class _Resolver:
 
         # `api.fetchAll()` / `app.models.Task()` -- the chain's head is a module.
         if dst_full and "." in dst_full:
-            head = dst_full.split(".", 1)[0]
+            receiver = dst_full.rsplit(".", 1)[0]
             for imp in source.imports:
-                if imp.symbol == "*" or (imp.symbol is None and imp.local_name in (None, head)):
+                if imp.symbol is None and receiver == (imp.alias or imp.module):
                     module = _raw_module(imp)
-                    if imp.local_name is None and not _module_matches_head(module, head, dst_full):
-                        continue
                     target = self._resolve_module(source, module)
                     if target is None:
                         external = True
@@ -607,11 +653,6 @@ def _family(language: str) -> str:
 
 def _raw_module(imp: _Import) -> str:
     return "." * imp.level + imp.module if imp.level else imp.module
-
-
-def _module_matches_head(module: str, head: str, dst_full: str) -> bool:
-    """``import a.b.c`` binds ``a``; also accept the full dotted prefix."""
-    return module == head or module.split(".")[0] == head or dst_full.startswith(module + ".")
 
 
 def _normalize(path: str) -> str:

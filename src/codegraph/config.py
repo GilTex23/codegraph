@@ -50,6 +50,7 @@ class IndexConfig:
     languages: list[str] = field(default_factory=lambda: list(KNOWN_LANGUAGES))
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
     max_file_size_kb: int = 512
+    python_semantics: bool = False
 
 
 @dataclass(slots=True)
@@ -146,7 +147,7 @@ def _build(raw: dict, path: Path) -> Config:
     index_raw = _section(raw, "index", where)
     _reject_unknown(
         index_raw,
-        {"include", "languages", "exclude", "max_file_size_kb"},
+        {"include", "languages", "exclude", "max_file_size_kb", "python_semantics"},
         where,
         "[index]",
     )
@@ -199,6 +200,7 @@ def _build(raw: dict, path: Path) -> Config:
             languages=languages,
             exclude=exclude,
             max_file_size_kb=max_kb,
+            python_semantics=_bool(index_raw, "python_semantics", False, where, "[index]"),
         ),
         server=ServerConfig(max_results=max_results, snippet_max_lines=snippet_max_lines),
         bridge=BridgeConfig(

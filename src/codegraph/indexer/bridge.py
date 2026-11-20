@@ -35,7 +35,7 @@ from .walker import read_source
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
 
 # A literal that plausibly names an API path.
-_PATH_LIKE = re.compile(r"^/[^\s?#]*$")
+_PATH_LIKE = re.compile(r"^/[^\s?#]*(?:[?#].*)?$")
 _TEMPLATE_HOLE = re.compile(r"\$\{[^}]*\}")
 _PATH_PARAM = re.compile(r"\{[^}]*\}")
 
@@ -494,7 +494,7 @@ def _match_endpoint(
     if len(exact) == 1:
         return exact[0].node_id, "exact"
     if len(exact) > 1:
-        return exact[0].node_id, "heuristic"
+        return None, "heuristic"
 
     # The frontend client usually carries a baseURL the backend path does not
     # know about (`/api`), so fall back to matching on whole trailing segments.
@@ -541,6 +541,7 @@ def _segments_skipped(endpoint_path: str, called_path: str) -> int | None:
 
 def _normalize_path(path: str) -> str:
     """``/tasks/{task_id}`` and ``/tasks/${id}`` both become ``/tasks/:param``."""
+    path = path.split("?", 1)[0].split("#", 1)[0]
     path = _TEMPLATE_HOLE.sub(":param", path)
     path = _PATH_PARAM.sub(":param", path)
     path = re.sub(r"/:[^/]+", "/:param", path)

@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .models import ParseResult
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS files (
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS edges (
     dst_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
     dst_name TEXT,
     dst_full TEXT,
+    receiver_type TEXT,
     type TEXT NOT NULL,
     line INTEGER,
     resolved INTEGER NOT NULL DEFAULT 0,
@@ -180,10 +181,14 @@ class Database:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)
         db = cls(conn, path)
-        db._configure()
-        if reset:
-            db._drop_schema()
-        db._ensure_schema()
+        try:
+            db._configure()
+            if reset:
+                db._drop_schema()
+            db._ensure_schema()
+        except (sqlite3.Error, SchemaVersionError):
+            db.close()
+            raise
         return db
 
     @classmethod
@@ -194,14 +199,18 @@ class Database:
             raise FileNotFoundError(
                 f"Graph database not found at {path}. Run 'codegraph build' first."
             )
-        uri = f"file:{path.resolve().as_posix()}?mode=ro"
+        uri = path.resolve().as_uri() + "?mode=ro"
         # The MCP runtime dispatches sync tool functions onto worker threads, so
         # the connection must not be pinned to its creating thread.  Access is
         # read-only and serialised by a lock in GraphTools.
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         db = cls(conn, path)
         conn.execute("PRAGMA foreign_keys = ON")
-        db._check_version()
+        try:
+            db._check_version()
+        except (sqlite3.Error, SchemaVersionError):
+            conn.close()
+            raise
         return db
 
     def _configure(self) -> None:
@@ -231,6 +240,14 @@ class Database:
         has_tables = self.conn.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes'"
         ).fetchone()[0]
+        if has_tables and version == 1:
+            with self.conn:
+                self.conn.execute("BEGIN IMMEDIATE")
+                if self.conn.execute("PRAGMA user_version").fetchone()[0] == 1:
+                    self.conn.execute("ALTER TABLE edges ADD COLUMN receiver_type TEXT")
+                    self.conn.execute("DELETE FROM meta WHERE key = 'codegraph_build'")
+                    self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if has_tables and version != SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"Graph at {self.path} uses schema version {version}, "
@@ -366,7 +383,7 @@ class Database:
 
         self.conn.executemany(
             "INSERT INTO edges(src_id, dst_id, dst_name, dst_full, type, line, "
-            "resolved, confidence) VALUES (?, NULL, ?, ?, ?, ?, 0, 'exact')",
+            "receiver_type, resolved, confidence) VALUES (?, NULL, ?, ?, ?, ?, ?, 0, 'exact')",
             [
                 (
                     id_map[edge.src_local],
@@ -374,6 +391,7 @@ class Database:
                     edge.dst_full,
                     edge.type,
                     edge.line,
+                    edge.receiver_type,
                 )
                 for edge in result.edges
                 if edge.src_local in id_map

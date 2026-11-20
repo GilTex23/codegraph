@@ -4,9 +4,8 @@ A local code-graph indexer. It parses a project into SQLite — declarations,
 calls, imports, inheritance, and the HTTP routes that join a frontend to its
 backend — and serves that graph to AI coding agents over MCP.
 
-The point is token economy. Instead of reading whole files to find out where
-something is defined or who calls it, an agent asks the graph and gets three
-lines back.
+Use the graph for questions that cross file or language boundaries. A targeted
+text search is often cheaper for a known literal or a single declaration.
 
 Fully offline and deterministic: no LLMs, no embeddings, no vector store, no
 network calls, no graph database. Python's `ast` for Python, `tree-sitter` for
@@ -65,6 +64,7 @@ files are skipped by content hash. Use `--full` to rebuild from scratch.
 codegraph init           # detect the layout and write the config
 codegraph stats          # what ended up in the graph
 codegraph query Task     # search without an agent, for debugging
+codegraph context "Who calls TaskService.list_tasks?" --max-tokens 300
 codegraph instructions   # the block telling an agent this repo has a graph
 codegraph serve          # MCP server on stdio
 ```
@@ -217,12 +217,9 @@ codegraph instructions                     # print the block
 codegraph instructions --write AGENTS.md   # insert it between markers
 ```
 
-Once a graph is built, the block argues its case with this project's own
-numbers, not a claim:
-
-| File | `Read` | `get_file_outline` |
-| --- | --- | --- |
-| `frontend/src/pages/Scheduler.tsx` | ~34k tokens | ~1.4k tokens |
+The generated table counts the full text and outline of up to three of the
+largest indexed files with the bundled `o200k_base` tokenizer. Session usage
+also includes tool descriptions, repeated inputs, cached inputs and follow-up reads.
 
 `--write` without a filename picks the `AGENTS.md` or `CLAUDE.md` already in the
 project. It never creates one — an agent file is someone's own writing — and a
@@ -239,6 +236,7 @@ session, and everything in it competes for the same context as the work.
 
 | Tool | Use it when |
 | --- | --- |
+| `context(task, max_tokens=1200)` | start with a symbol, a file, a route such as `GET /api/tasks/{id}`, or a question about its callers |
 | `get_project_overview()` | starting a task in an unfamiliar repo |
 | `get_domain_slice(domain)` | you need every layer touching one entity, in one call |
 | `search_symbol(query, type=None)` | you know roughly what something is called |
@@ -252,8 +250,14 @@ session, and everything in it competes for the same context as the work.
 | `get_neighbors(name, depth=1)` | to get context around an unfamiliar symbol |
 | `trace_endpoint(path_or_name)` | to follow one HTTP route end to end |
 
-All of them open the database read-only, respect `server.max_results`, and
-never return function bodies except `get_definition` on a short declaration.
+The tools open SQLite read-only. `context` limits the returned text to the
+specified number of `o200k_base` tokens, including a final ellipsis when lines
+are omitted. The MCP envelope and the client's tokenizer can affect actual usage.
+Quote an identifier in backticks to give it priority over other words in a
+question. For ambiguous names use `path/to/file.py::Class.method`. Callers
+point at call sites and callees at definitions. `get_definition` checks the
+file's normalized content hash before returning coordinates or source. Other
+graph relationships describe the last build.
 
 `get_change_impact` reads the git working tree when it can — changed files, the
 declarations inside the changed line ranges, and the callers of those. Git is
@@ -281,14 +285,24 @@ after the call receiving it (`add_action(wp_head)`) — WordPress themes keep
 most of their logic there, and without a node the block would be invisible and
 every call inside it credited to a file thousands of lines long.
 
-PHP resolution is exact where the language is: functions live in one global
-namespace with no import mechanism, so a unique project-wide name *is* the
-definition, and a bare name the project does not declare *must* come from
-outside it — the runtime, WordPress core, a plugin. Both are facts, not
-heuristics.
+For WordPress code using global PHP functions, the resolver links a bare call
+to a unique project-wide top-level declaration and treats an undeclared bare
+function as external. These rules assume a global function name. In PHP code
+using namespaces or function aliases, verify the target at the call site.
 
-**Resolution** runs as a whole-project pass, in priority order: a declaration
-in the same file (exact), an explicitly imported name (exact), a
+**Resolution** distinguishes a direct `self.method()` from `self.db.method()`.
+For Python parameters with a simple class annotation, it can identify the
+method of that class, including a class imported under an alias. These targets
+are marked heuristic because subclasses can override a method at runtime.
+A qualified receiver alone cannot establish an exact same-file match.
+For deeper Python type inference, install the `semantic` extra
+(`python -m pip install -e ".[semantic]"` in this checkout) and set
+`python_semantics = true` under `[index]` in the target project. A build then
+asks Jedi about unresolved or heuristic member calls with indexed candidate
+names. It accepts a single matching method declaration in the index. These
+inferred targets retain the heuristic label. The default build skips this
+additional analysis.
+Resolution checks a local declaration for a bare name, explicit imports, a
 project-globally unique name (heuristic), otherwise unresolved with the raw
 target name kept. Re-export chains are followed to the real declaration, so
 `from app.models import Task` lands on `app/models/task.py`, not on
@@ -372,8 +386,33 @@ Two deliberate departures from the obvious design, both load-bearing:
   follow re-export chains, and that structure has to survive builds in which
   the importing file is skipped.
 
-Schema version lives in `PRAGMA user_version`; a mismatch asks for
-`codegraph build --full` rather than failing obscurely.
+The schema version lives in `PRAGMA user_version`. A normal build upgrades
+version 1 to version 2 and refreshes its parsed evidence.
+
+## Measuring agent tasks
+
+`benchmarks/agent_eval.py` uses a private JSON manifest of projects and questions.
+Each project specifies a Git root, a pinned revision, source pathspecs in
+`include`, an optional `framework`, and `cases` with an ID, question and required
+answer fragments. Keep the manifest and results outside your source snapshots.
+
+```bash
+python benchmarks/agent_eval.py cases.json results --cbm /path/to/codebase-memory-mcp --model MODEL --prepare-only
+python benchmarks/retrieval_eval.py local-cases.json results --cbm /path/to/codebase-memory-mcp
+```
+
+Preparation copies committed Python, TypeScript and PHP source into a dedicated
+output directory and builds both indexes locally. For the offline diagnostic,
+add an `anchor` and an `intent` (`callers` or `search`) to each case. It counts the
+text from one lookup per tool and records which expected fragments appear.
+Inspect the evidence for false positives before interpreting completeness.
+
+Removing `--prepare-only` from the first command starts fresh read-only Codex
+sessions using the specified model and account. Source fragments read by the
+agent are sent to its provider. Each question runs with ripgrep, CodeGraph plus
+ripgrep, and Codebase Memory MCP plus ripgrep. The JSONL records the final
+answer, matching fragments, actual usage including cached input, calls and
+elapsed seconds. Completed trials are skipped on restart.
 
 ## Development
 

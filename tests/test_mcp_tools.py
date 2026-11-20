@@ -13,6 +13,7 @@ from codegraph.server.mcp_server import build_server
 from codegraph.server.tools import GraphTools, _normalize_domain, split_identifier
 
 EXPECTED_TOOLS = {
+    "context",
     "search_symbol",
     "get_definition",
     "get_callers",
@@ -275,14 +276,15 @@ def test_change_impact_reads_the_git_working_tree(config: Config, summary):
 
 
 def test_get_neighbors_shows_both_directions(tools: GraphTools):
-    output = tools.get_neighbors("Task", depth=1)
+    output = tools.get_neighbors("backend/app/models/task.py::Task", depth=1)
     assert "-> inherits Base" in output
     assert "<- calls list_tasks" in output
 
 
 def test_get_neighbors_caps_depth_at_two(tools: GraphTools):
-    deep = tools.get_neighbors("Task", depth=9)
-    assert deep == tools.get_neighbors("Task", depth=2)
+    name = "backend/app/models/task.py::Task"
+    deep = tools.get_neighbors(name, depth=9)
+    assert deep == tools.get_neighbors(name, depth=2)
 
 
 # -------------------------------------------------------------------- overview
@@ -389,3 +391,5 @@ def test_tools_are_callable_through_the_server(config: Config, summary):
     assert "backend/app/models/" in asyncio.run(call("get_project_overview", {}))
     assert "[model]" in asyncio.run(call("get_domain_slice", {"domain": "tasks"}))
     assert "TaskService" in asyncio.run(call("search_symbol", {"query": "TaskService"}))
+    evidence = asyncio.run(call("context", {"task": "Find TaskService", "max_tokens": 100}))
+    assert "TaskService" in evidence

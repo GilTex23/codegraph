@@ -18,6 +18,8 @@ import sqlite3
 from pathlib import Path
 
 from .config import Config
+from .indexer.walker import hash_text, read_source
+from .tokens import token_count
 
 MARKER_START = "<!-- codegraph:start -->"
 MARKER_END = "<!-- codegraph:end -->"
@@ -33,11 +35,8 @@ AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
 # decision, and only the worst few, or the table stops being read.
 COST_SAMPLE = 3
 COST_MIN_BYTES = 12_000
-# Tokens per character, near enough for code and honest about being an
-# estimate. The point is the ratio, which no rounding here can flatter.
-CHARS_PER_TOKEN = 4
-
 _ROWS: tuple[tuple[str, str], ...] = (
+    ("trace a task from a symbol, route or file", 'context("task", max_tokens=1200)'),
     ("bearings in an unfamiliar area", "get_project_overview()"),
     ("every layer touching one entity", 'get_domain_slice("orders")'),
     ("find a symbol by name or docstring", 'search_symbol("...")'),
@@ -64,12 +63,10 @@ def render(config: Config) -> str:
     lines = [
         MARKER_START,
         GENERATED_NOTE,
-        "## Query the code graph before reading files",
+        "## CodeGraph navigation",
         "",
-        "This repo is indexed by `codegraph` and served over MCP. The graph answers",
-        '"where is it declared", "who calls it", "what is in this file" in a few lines;',
-        "finding the same answer by reading files costs orders of magnitude more. Reach",
-        "for a file only for a body the graph does not carry.",
+        "Use the graph for relationships and file outlines. Use a targeted text search",
+        "for a known name or literal. Read the relevant source range for implementation details.",
         "",
         "| What you need | Call |",
         "| --- | --- |",
@@ -79,7 +76,8 @@ def render(config: Config) -> str:
     if measured:
         lines += [
             "",
-            "What that saves here, measured on this graph:",
+            "Output sizes measured on this graph for the largest indexed files (o200k_base).",
+            "Session costs also depend on the task, tool calls and subsequent reads.",
             "",
             "| File | `Read` | `get_file_outline` |",
             "| --- | --- | --- |",
@@ -91,9 +89,9 @@ def render(config: Config) -> str:
 
     lines += [
         "",
-        "A result tagged `[heuristic]` is a name match, not a proven link -- confirm it",
-        "before acting on it. `third-party` means the symbol comes from a library and is",
-        "not in the graph.",
+        "A result tagged `[heuristic]` is inferred from names, types or route patterns.",
+        "Check the call site to confirm it. `third-party` identifies a library symbol",
+        "outside the graph.",
         "",
         "The graph is a snapshot of the last `codegraph build`. Run it again after",
         "substantial edits: it is incremental and skips unchanged files.",
@@ -121,7 +119,7 @@ def _measure(config: Config) -> tuple[list[tuple[str, int, int]], bool]:
 
     try:
         heaviest = tools.db.conn.execute(
-            "SELECT path, size_bytes FROM files WHERE size_bytes >= ? "
+            "SELECT path, content_hash FROM files WHERE size_bytes >= ? "
             "ORDER BY size_bytes DESC LIMIT ?",
             (COST_MIN_BYTES, COST_SAMPLE),
         ).fetchall()
@@ -130,14 +128,20 @@ def _measure(config: Config) -> tuple[list[tuple[str, int, int]], bool]:
         ).fetchone()[0]
         measured = []
         for row in heaviest:
+            try:
+                source = read_source(config.root / row["path"])
+            except OSError:
+                continue
+            if hash_text(source) != row["content_hash"]:
+                continue
             # The real outline, not an estimate of one: whatever truncation
             # `server.max_results` applies is part of what the agent would pay.
             outline = tools.get_file_outline(row["path"])
             measured.append(
                 (
                     row["path"],
-                    row["size_bytes"] // CHARS_PER_TOKEN,
-                    len(outline) // CHARS_PER_TOKEN,
+                    token_count(source),
+                    token_count(outline),
                 )
             )
     except sqlite3.Error:

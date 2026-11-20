@@ -47,6 +47,7 @@ CLAUDE_SETTINGS = "settings.local.json"
 # not know, so the config it gets pre-approves the lot; a test keeps this list
 # in step with the server.
 SERVER_TOOLS = (
+    "context",
     "search_symbol",
     "get_definition",
     "get_callers",

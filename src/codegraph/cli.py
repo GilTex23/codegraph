@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--config", type=Path, help="path to .codegraph.toml")
     query.add_argument("--definition", action="store_true", help="show the full definition")
 
+    context = subparsers.add_parser("context", help="retrieve graph evidence within a token budget")
+    context.add_argument("task", help="question containing a symbol, route or path")
+    context.add_argument("--max-tokens", type=int, default=1200)
+    context.add_argument("--config", type=Path, help="path to .codegraph.toml")
+
     return parser
 
 
@@ -99,7 +104,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_instructions(config, args.write)
         if args.command == "query":
             return _cmd_query(config, args.symbol, definition=args.definition)
-    except SchemaVersionError as error:
+        if args.command == "context":
+            from .server.tools import GraphTools
+
+            tools = GraphTools(config)
+            try:
+                print(tools.context(args.task, args.max_tokens))
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
+            finally:
+                tools.close()
+    except (SchemaVersionError, ConfigError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     except FileNotFoundError as error:

@@ -123,7 +123,7 @@ def read_source(path: Path) -> str:
     on Windows and Linux; undecodable bytes are replaced rather than raising,
     so one broken file cannot abort a build.
     """
-    with open(path, encoding="utf-8", errors="replace", newline="") as handle:
+    with open(path, encoding="utf-8-sig", errors="replace", newline="") as handle:
         return normalize_text(handle.read())
 
 

@@ -75,6 +75,7 @@ class Edge:
     dst_name: str
     line: int | None = None
     dst_full: str | None = None
+    receiver_type: str | None = None  # simple class annotation on a Python receiver
 
 
 @dataclass(slots=True)

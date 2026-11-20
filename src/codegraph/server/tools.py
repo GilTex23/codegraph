@@ -18,6 +18,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..db import Database
+from ..indexer.walker import hash_text, read_source
 
 MAX_DEPTH = 2
 NEIGHBOR_HARD_LIMIT = 60
@@ -44,6 +45,7 @@ class _Row:
     signature: str | None
     docstring: str | None
     qualified_name: str
+    content_hash: str
 
 
 class GraphTools:
@@ -72,24 +74,32 @@ class GraphTools:
     def _nodes_named(self, name: str) -> list[_Row]:
         rows = self._query(
             "SELECT n.id, n.name, n.type, f.path, n.line_start, n.line_end, n.signature, "
-            "n.docstring, n.qualified_name FROM nodes n JOIN files f ON f.id = n.file_id "
+            "n.docstring, n.qualified_name, f.content_hash FROM nodes n JOIN files f "
+            "ON f.id = n.file_id "
             "WHERE n.name = ? OR n.qualified_name = ? ORDER BY "
             "CASE n.type WHEN 'module' THEN 1 ELSE 0 END, f.path",
             (name, name),
         )
-        if not rows:
+        if not rows and "." in name:
             rows = self._query(
                 "SELECT n.id, n.name, n.type, f.path, n.line_start, n.line_end, n.signature, "
-                "n.docstring, n.qualified_name FROM nodes n JOIN files f ON f.id = n.file_id "
-                "WHERE n.qualified_name LIKE ? ORDER BY f.path LIMIT 20",
-                (f"%::{name}",),
+                "n.docstring, n.qualified_name, f.content_hash FROM nodes n JOIN files f "
+                "ON f.id = n.file_id WHERE substr(n.qualified_name, -length(?)) = ? "
+                "ORDER BY f.path LIMIT 20",
+                ("::" + name, "::" + name),
             )
-        return [_Row(**dict(row)) for row in rows]
+        symbols = [_Row(**dict(row)) for row in rows]
+        return [row for row in symbols if row.type != "module"] or symbols
 
     # -------------------------------------------------------------- searching
 
-    def search_symbol(self, query: str, type: str | None = None) -> str:
-        expression = _fts_expression(query)
+    def context(self, task: str, max_tokens: int = 1200) -> str:
+        from .context import task_context
+
+        return task_context(self, task, max_tokens)
+
+    def search_symbol(self, query: str, type: str | None = None, *, match_any: bool = False) -> str:
+        expression = _fts_expression(query, match_any=match_any)
         rows: list[sqlite3.Row] = []
         if expression:
             sql = (
@@ -102,8 +112,11 @@ class GraphTools:
                 sql += " AND n.type = ?"
                 params.append(type)
             # Module nodes match almost any path-ish query; keep them last.
-            sql += " ORDER BY (n.type = 'module'), rank LIMIT ?"
-            params.append(self.limit + 1)
+            sql += (
+                " ORDER BY (n.name = ? OR n.qualified_name = ?) DESC, "
+                "(n.type = 'module'), rank, f.path, n.line_start LIMIT ?"
+            )
+            params.extend((query, query, self.limit + 1))
             try:
                 rows = self._query(sql, tuple(params))
             except sqlite3.OperationalError:
@@ -137,14 +150,12 @@ class GraphTools:
         if not matches:
             return f"no definition found for {name!r}"
         if len(matches) > 1:
-            header = f"{len(matches)} definitions named {name!r}; pass a qualified_name:"
-            lines = [
-                f"  {row.qualified_name}  ({row.type}, {row.path}:{row.line_start})"
-                for row in matches[: self.limit]
-            ]
-            return "\n".join([header, *lines])
+            return self._disambiguate(name, matches)
 
         row = matches[0]
+        source, warning = self._checked_source(row.path, row.content_hash)
+        if warning:
+            return warning
         out = [
             f"{row.qualified_name}  [{row.type}]",
             f"{row.path}:{row.line_start}-{row.line_end}",
@@ -157,10 +168,8 @@ class GraphTools:
         span = row.line_end - row.line_start + 1
         budget = self.config.server.snippet_max_lines
         if span <= budget:
-            source = self._read_lines(row.path, row.line_start, row.line_end)
-            if source is not None:
-                out.append("---")
-                out.append(source)
+            out.append("---")
+            out.append("\n".join(source.split("\n")[row.line_start - 1 : row.line_end]))
         else:
             out.append(
                 f"--- body omitted ({span} lines > snippet_max_lines={budget}); "
@@ -168,31 +177,40 @@ class GraphTools:
             )
         return "\n".join(out)
 
-    def _read_lines(self, rel_path: str, start: int, end: int) -> str | None:
-        path = self.config.root / rel_path
+    def _checked_source(self, path: str, digest: str) -> tuple[str, str]:
         try:
-            with open(path, encoding="utf-8", errors="replace", newline="") as handle:
-                text = handle.read()
+            source = read_source(self.config.root / path)
         except OSError:
-            return None
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        return "\n".join(lines[start - 1 : end])
+            return "", f"Source unavailable: {path}. Run codegraph build to refresh the index."
+        if hash_text(source) != digest:
+            return "", f"Stale index: {path} changed. Run codegraph build for current lines."
+        return source, ""
+
+    def _disambiguate(self, name: str, matches: list[_Row]) -> str:
+        lines = [f"{len(matches)} definitions named {name!r}; pass a qualified_name:"]
+        lines.extend(
+            f"  {r.qualified_name}  ({r.type}, {r.path}:{r.line_start})"
+            for r in matches[: self.limit]
+        )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ edges
 
     def get_callers(self, name: str) -> str:
+        matches = self._nodes_named(name)
+        if len(matches) > 1:
+            return self._disambiguate(name, matches)
         rows = self._query(
             "SELECT sf.path, s.name, s.type, e.line, e.confidence "
             "FROM edges e JOIN nodes s ON s.id = e.src_id JOIN files sf ON sf.id = s.file_id "
-            "JOIN nodes t ON t.id = e.dst_id "
-            "WHERE e.type = 'calls' AND t.name = ? AND e.resolved = 1 "
-            "ORDER BY sf.path, e.line LIMIT ?",
-            (name, self.limit + 1),
+            "WHERE e.type = 'calls' AND e.dst_id = ? AND e.resolved = 1 "
+            "ORDER BY (e.confidence = 'heuristic'), sf.path, e.line LIMIT ?",
+            (matches[0].id if matches else None, self.limit + 1),
         )
         if not rows:
             unresolved = self._query(
                 "SELECT count(*) FROM edges WHERE type = 'calls' AND dst_name = ? AND resolved = 0",
-                (name,),
+                (matches[0].name if matches else name,),
             )[0][0]
             if unresolved:
                 return (
@@ -211,15 +229,15 @@ class GraphTools:
         matches = self._nodes_named(name)
         if not matches:
             return f"no definition found for {name!r}"
-        ids = tuple(row.id for row in matches[:5])
-        placeholders = ",".join("?" * len(ids))
+        if len(matches) > 1:
+            return self._disambiguate(name, matches)
         rows = self._query(
-            "SELECT e.dst_name, e.line, e.resolved, e.confidence, tf.path, t.type "
+            "SELECT e.dst_name, e.line, e.resolved, e.confidence, tf.path, t.type, t.line_start "
             "FROM edges e LEFT JOIN nodes t ON t.id = e.dst_id "
             "LEFT JOIN files tf ON tf.id = t.file_id "
-            f"WHERE e.type = 'calls' AND e.src_id IN ({placeholders}) "
+            "WHERE e.type = 'calls' AND e.src_id = ? "
             "ORDER BY e.line LIMIT ?",
-            (*ids, self.limit + 1),
+            (matches[0].id, self.limit + 1),
         )
         if not rows:
             return f"{name!r} calls nothing (or has no body in the graph)"
@@ -227,7 +245,9 @@ class GraphTools:
         for row in rows[: self.limit]:
             if row["resolved"]:
                 mark = "  [heuristic]" if row["confidence"] == "heuristic" else ""
-                lines.append(f"{row['dst_name']}  {row['type']}  {row['path']}:{row['line']}{mark}")
+                lines.append(
+                    f"{row['dst_name']}  {row['type']}  {row['path']}:{row['line_start']}{mark}"
+                )
             elif row["confidence"] == "external":
                 lines.append(f"{row['dst_name']}  third-party  (call at line {row['line']})")
             else:
@@ -240,6 +260,9 @@ class GraphTools:
         file = self._find_file(path)
         if file is None:
             return f"file not indexed: {path}"
+        _, warning = self._checked_source(file["path"], file["content_hash"])
+        if warning:
+            return warning
         rows = self._query(
             "SELECT id, type, name, qualified_name, parent_id, line_start, line_end, signature, "
             "is_async, is_exported FROM nodes WHERE file_id = ? AND type != 'module' "
@@ -308,13 +331,14 @@ class GraphTools:
     def _find_file(self, path: str) -> sqlite3.Row | None:
         normalized = Path(path).as_posix().lstrip("./")
         row = self._query(
-            "SELECT id, path, language FROM files WHERE path = ? OR lower(path) = ?",
+            "SELECT id, path, language, content_hash FROM files WHERE path = ? OR lower(path) = ?",
             (normalized, normalized.lower()),
         )
         if row:
             return row[0]
         row = self._query(
-            "SELECT id, path, language FROM files WHERE path LIKE ? ORDER BY length(path) LIMIT 1",
+            "SELECT id, path, language, content_hash FROM files WHERE path LIKE ? "
+            "ORDER BY length(path) LIMIT 1",
             (f"%{normalized}",),
         )
         return row[0] if row else None
@@ -438,8 +462,6 @@ class GraphTools:
         return stale, "no git here; files changed since the last build"
 
     def _files_differing_from_the_graph(self) -> dict[str, list[tuple[int, int]]]:
-        from ..indexer.walker import hash_text, read_source
-
         changed: dict[str, list[tuple[int, int]]] = {}
         for row in self._query("SELECT path, content_hash FROM files ORDER BY path"):
             try:
@@ -457,6 +479,8 @@ class GraphTools:
         matches = self._nodes_named(name)
         if not matches:
             return f"no definition found for {name!r}"
+        if len(matches) > 1:
+            return self._disambiguate(name, matches)
         start = matches[0]
 
         seen: set[int] = {start.id}
@@ -593,11 +617,21 @@ class GraphTools:
             "LEFT JOIN nodes handler ON handler.id = h.dst_id "
             "WHERE n.type = 'endpoint' AND (n.qualified_name LIKE ? OR n.name LIKE ? "
             "OR handler.name = ? OR handler.qualified_name = ?) "
-            "ORDER BY n.qualified_name LIMIT ?",
-            (f"%{path_or_name}%", f"%{path_or_name}%", path_or_name, path_or_name, self.limit),
+            "ORDER BY (n.qualified_name = ?) DESC, n.qualified_name LIMIT ?",
+            (
+                f"%{path_or_name}%",
+                f"%{path_or_name}%",
+                path_or_name,
+                path_or_name,
+                path_or_name,
+                self.limit,
+            ),
         )
         if not endpoints:
             return self._trace_without_bridge(path_or_name)
+        exact = [row for row in endpoints if row["qualified_name"] == path_or_name]
+        if exact:
+            endpoints = exact
 
         out: list[str] = []
         for endpoint in endpoints:
@@ -647,6 +681,8 @@ class GraphTools:
         matches = self._nodes_named(path_or_name)
         if not matches:
             return f"{note}no endpoint or function matches {path_or_name!r}".strip()
+        if len(matches) > 1:
+            return self._disambiguate(path_or_name, matches)
         row = matches[0]
         body = [f"{row.qualified_name}  [{row.type}]  {row.path}:{row.line_start}"]
         body.append(self.get_callees(row.qualified_name))
@@ -732,7 +768,7 @@ def split_identifier(text: str) -> list[str]:
     return [part for part in parts if part]
 
 
-def _fts_expression(query: str) -> str:
+def _fts_expression(query: str, *, match_any: bool = False) -> str:
     """Build an FTS5 expression that also matches camelCase identifiers.
 
     ``parse`` has to find ``parseConfig``, which the tokenizer keeps whole, so
@@ -748,7 +784,7 @@ def _fts_expression(query: str) -> str:
         if len(pieces) > 1:
             options.add(" AND ".join(f'"{piece}"*' for piece in pieces))
         clauses.append("(" + " OR ".join(sorted(options)) + ")")
-    return " AND ".join(clauses)
+    return (" OR " if match_any else " AND ").join(clauses)
 
 
 def _singular(word: str) -> str:

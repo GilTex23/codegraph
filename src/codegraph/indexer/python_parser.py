@@ -67,6 +67,7 @@ class _Extractor:
         is_package_init: bool,
     ) -> None:
         self.b = builder
+        self.parameter_types: dict[int, dict[str, str]] = {}
         self.rel_path = rel_path
         self.module_local = module_local
         self.is_package_init = is_package_init
@@ -183,6 +184,22 @@ class _Extractor:
         self._decorators(stmt, node.local_id)
         for default in [*stmt.args.defaults, *[d for d in stmt.args.kw_defaults if d is not None]]:
             self._calls_in(default, node.local_id)
+        annotated = {}
+        for arg in (*stmt.args.posonlyargs, *stmt.args.args, *stmt.args.kwonlyargs):
+            hint = arg.annotation
+            if isinstance(hint, ast.Name):
+                annotated[arg.arg] = hint.id
+            elif (
+                isinstance(hint, ast.Constant)
+                and isinstance(hint.value, str)
+                and hint.value.isidentifier()
+            ):
+                annotated[arg.arg] = hint.value
+        if annotated:
+            for item in ast.walk(stmt):
+                if isinstance(item, ast.Name) and isinstance(item.ctx, (ast.Store, ast.Del)):
+                    annotated.pop(item.id, None)
+            self.parameter_types[node.local_id] = annotated
         self._body(
             stmt.body,
             parent=node.local_id,
@@ -310,12 +327,16 @@ class _Extractor:
         for call in _iter_calls(subtree):
             short, full = _target_name(call.func)
             if short:
+                receiver_type = None
+                if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+                    receiver_type = self.parameter_types.get(owner, {}).get(call.func.value.id)
                 self.b.add_edge(
                     src_local=owner,
                     type="calls",
                     dst_name=short,
                     dst_full=full,
                     line=call.lineno,
+                    receiver_type=receiver_type,
                 )
 
     def _is_exported(self, name: str, *, top_level: bool) -> bool:

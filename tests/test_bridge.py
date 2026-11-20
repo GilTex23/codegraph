@@ -7,8 +7,15 @@ from pathlib import Path
 from codegraph.config import Config, load_config
 from codegraph.db import Database
 from codegraph.indexer import build
-from codegraph.indexer.bridge import _normalize_path
+from codegraph.indexer.bridge import _find_api_calls, _normalize_path
 from helpers import edge_rows, find_edge
+
+
+def test_route_matching_ignores_query_and_fragment():
+    assert _normalize_path("/tasks/${id}?lang=ru#top") == "/tasks/:param"
+    assert _find_api_calls("client.get('/tasks?lang=ru#top')", "typescript") == [
+        ("GET", "/tasks?lang=ru#top", 1)
+    ]
 
 
 def endpoints(graph: Database) -> dict[str, dict]:

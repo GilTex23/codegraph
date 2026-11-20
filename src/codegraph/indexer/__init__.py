@@ -22,6 +22,7 @@ from ..models import ParseResult
 from .bridge import BridgeStats, run_bridge
 from .php_parser import parse_php
 from .python_parser import parse_python
+from .python_semantics import PythonSemantics
 from .resolver import ResolveStats, resolve
 from .ts_parser import parse_typescript
 from .walker import walk
@@ -139,6 +140,7 @@ def build(
     """Index the project described by ``config`` into its graph database."""
     started = time.perf_counter()
     summary = BuildSummary()
+    semantics = PythonSemantics(config.root) if config.index.python_semantics else None
 
     # A codegraph upgrade can change how names resolve or what the parsers
     # extract, and unchanged files are otherwise never revisited.  Rebuild once,
@@ -182,7 +184,7 @@ def build(
                 for path in stale:
                     log(f"  removed {path}")
 
-        resolve_stats: ResolveStats = resolve(db, config.root)
+        resolve_stats: ResolveStats = resolve(db, config.root, semantics)
         summary.heuristic_edges = resolve_stats.heuristic
         summary.dropped_builtin_edges = resolve_stats.dropped_builtins
         summary.external_edges = resolve_stats.external

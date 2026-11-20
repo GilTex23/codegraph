@@ -18,7 +18,8 @@ INSTRUCTIONS = """\
 A pre-built graph of this codebase: declarations, calls, imports, inheritance,
 and (when configured) the HTTP routes joining frontend to backend.
 
-Prefer these tools over reading files. Typical flow:
+Use context(task) for cross-file questions with a known symbol, route or path.
+For a known literal or a single declaration, a targeted text search also works.
   get_project_overview     -> orient yourself in an unfamiliar repo
   get_domain_slice("task") -> every layer touching one domain entity, in one call
   search_symbol / get_definition -> find and read one declaration
@@ -28,9 +29,9 @@ Prefer these tools over reading files. Typical flow:
   get_change_impact        -> what am I editing, and what does it break
   trace_endpoint           -> follow one HTTP route end to end
 
-A result tagged `[heuristic]` is a name match rather than a proven link --
-confirm it before acting on it. `third-party` means the symbol comes from a
-library and is not in the graph.
+A result tagged `[heuristic]` is a candidate inferred from names, types or
+route patterns. Check the call site to confirm it. `third-party` identifies a
+symbol supplied by a library outside the graph.
 
 The graph is a snapshot; re-run `codegraph build` after large edits.
 """
@@ -46,6 +47,15 @@ def build_server(config: Config):
         version="0.1.0",
         instructions=INSTRUCTIONS,
     )
+
+    @server.tool()
+    def context(task: str, max_tokens: int = 1200) -> str:
+        """Find compact evidence for a task. Include a symbol, HTTP route or file path.
+
+        Ask who calls a symbol to see call sites. max_tokens bounds the returned
+        text in o200k_base tokens. A trailing ellipsis marks omitted lines.
+        """
+        return tools.context(task, max_tokens)
 
     @server.tool()
     def search_symbol(query: str, type: str | None = None) -> str:
@@ -73,9 +83,8 @@ def build_server(config: Config):
     def get_callers(name: str) -> str:
         """List everything that calls `name`, with file and call-site line.
 
-        Use before changing a signature or deleting code. Edges inferred from a
-        globally unique name rather than an explicit import are tagged
-        `[heuristic]` -- treat those as leads, not proof.
+        Use before changing a signature or deleting code. Check call sites
+        tagged `[heuristic]` to confirm the inferred target.
         """
         return tools.get_callers(name)
 
